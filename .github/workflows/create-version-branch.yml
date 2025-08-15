@@ -1,4 +1,4 @@
-name: 从上游标签或master分支创建版本分支
+name: 从上游标签或master分支创建版本分支（保护工作流文件）
 
 on:
   workflow_dispatch:
@@ -16,7 +16,7 @@ on:
         required: false
         default: "1.4.1"
       force:
-        description: "强制覆盖同名远端分支"
+        description: "强制覆盖同名远端分支（全量替换而非增量合并）"
         required: true
         type: boolean
         default: false
@@ -47,7 +47,6 @@ jobs:
           VERSION="${{ github.event.inputs.version }}"
           TARGET_DIR="${{ github.event.inputs.target_directory }}"
           
-          # 验证输入
           if [ "$SOURCE_TYPE" = "tag" ] && [ -z "$VERSION" ]; then
             echo "::error::当源类型为tag时，版本号不能为空"
             echo "valid=false" >> "$GITHUB_OUTPUT"
@@ -60,9 +59,6 @@ jobs:
             exit 1
           fi
           
-          # 确定目标分支：
-          # - 标签模式：使用标签名作为分支名
-          # - master分支模式：固定使用"latest"作为本地分支名
           if [ "$SOURCE_TYPE" = "tag" ]; then
             echo "target_branch=$VERSION" >> "$GITHUB_OUTPUT"
           else
@@ -82,149 +78,118 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+          ref: ${{ needs.validate_inputs.outputs.target_branch }}
 
-      - name: Configure git identity & remove App extraheader
+      - name: 保存工作流文件到临时位置（防止被覆盖）
+        run: |
+          # 创建临时目录保存当前工作流文件
+          mkdir -p .github/workflows_temp
+          if [ -f ".github/workflows/create-version-branch.yml" ]; then
+            cp ".github/workflows/create-version-branch.yml" ".github/workflows_temp/"
+            echo "已备份工作流文件"
+          else
+            echo "工作流文件不存在，无需备份"
+          fi
+
+      - name: Configure git identity
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --global --unset-all http.https://github.com/.extraheader || true
 
-      - name: Add upstream & fetch source
-        id: fetch_source
+      - name: Add upstream repository
         run: |
-          set -euo pipefail
+          UPSTREAM="${{ github.event.inputs.upstream_repo }}"
+          git remote add upstream "https://github.com/${UPSTREAM}.git" || true
+          git fetch upstream
+
+      - name: Determine source and target information
+        id: source_info
+        run: |
           SOURCE_TYPE="${{ github.event.inputs.source_type }}"
           VERSION="${{ github.event.inputs.version }}"
-          UPSTREAM="${{ github.event.inputs.upstream_repo }}"
-          TARGET_DIR="${{ needs.validate_inputs.outputs.target_dir }}"
           TARGET_BRANCH="${{ needs.validate_inputs.outputs.target_branch }}"
           
-          # 明确区分：
-          # - 上游默认分支：master（从上游仓库拉取）
-          # - 本地目标分支：latest（存储上游master分支内容）
           if [ "$SOURCE_TYPE" = "tag" ]; then
-            SOURCE_REF="refs/tags/${VERSION}"
-            FETCH_REF="refs/tags/upstream-${VERSION}"
+            echo "source_ref=refs/tags/${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "source_name=tag ${VERSION}" >> "$GITHUB_OUTPUT"
           else
-            SOURCE_REF="refs/heads/master"  # 上游默认分支为master
-            FETCH_REF="refs/remotes/upstream/master"
+            echo "source_ref=refs/heads/master" >> "$GITHUB_OUTPUT"
+            echo "source_name=master branch" >> "$GITHUB_OUTPUT"
           fi
-
-          git remote add upstream "https://github.com/${UPSTREAM}.git" || true
-          
-          if [ "$SOURCE_TYPE" = "tag" ]; then
-            git fetch --depth=1 upstream "${SOURCE_REF}:${FETCH_REF}" \
-            || git fetch upstream "${SOURCE_REF}:${FETCH_REF}"
-          else
-            # 拉取上游master分支最新内容
-            git fetch upstream master
-          fi
-
-          # 获取对应提交的SHA值
-          if [ "$SOURCE_TYPE" = "tag" ]; then
-            SHA="$(git rev-list -n 1 "${FETCH_REF}")"
-          else
-            # 从上游master分支获取最新提交
-            SHA="$(git rev-parse upstream/master)"
-          fi
-          
-          if [ -z "$SHA" ]; then
-            echo "::error::上游 ${UPSTREAM} 不存在指定的源"
-            exit 1
-          fi
-          
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "target_branch=$TARGET_BRANCH" >> "$GITHUB_OUTPUT"
-          echo "target_dir=$TARGET_DIR" >> "$GITHUB_OUTPUT"
 
-          if git ls-tree -r --name-only "$SHA" | grep -q '^.github/workflows/'; then
-            echo "has_workflows=true"  >> "$GITHUB_OUTPUT"
+      - name: Check if target branch exists locally
+        id: branch_check
+        run: |
+          TARGET_BRANCH="${{ needs.validate_inputs.outputs.target_branch }}"
+          if git show-ref --verify --quiet "refs/heads/${TARGET_BRANCH}"; then
+            echo "branch_exists=true" >> "$GITHUB_OUTPUT"
           else
-            echo "has_workflows=false" >> "$GITHUB_OUTPUT"
+            echo "branch_exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Ensure PAT if workflows exist in the source
-        if: ${{ steps.fetch_source.outputs.has_workflows == 'true' }}
+      - name: Initialize new branch from upstream source (首次拉取)
+        if: ${{ steps.branch_check.outputs.branch_exists == 'false' || github.event.inputs.force == 'true' }}
+        run: |
+          SOURCE_REF="${{ steps.source_info.outputs.source_ref }}"
+          TARGET_BRANCH="${{ steps.source_info.outputs.target_branch }}"
+          
+          git checkout -B "$TARGET_BRANCH" "upstream/${SOURCE_REF#refs/heads/}"
+          git commit --allow-empty -m "Initial branch from upstream ${{ steps.source_info.outputs.source_name }}" || true
+
+      - name: Incremental merge upstream changes (增量拉取)
+        if: ${{ steps.branch_check.outputs.branch_exists == 'true' && github.event.inputs.force == 'false' }}
+        run: |
+          SOURCE_REF="${{ steps.source_info.outputs.source_ref }}"
+          TARGET_BRANCH="${{ steps.source_info.outputs.target_branch }}"
+          SOURCE_NAME="${{ steps.source_info.outputs.source_name }}"
+          
+          git fetch upstream
+          
+          # 合并时排除工作流文件，防止被上游版本覆盖
+          git merge --no-ff -X theirs "upstream/${SOURCE_REF#refs/heads/}" \
+            -m "Merge upstream $SOURCE_NAME into $TARGET_BRANCH (auto-resolve conflicts with upstream version)" \
+            --exclude ".github/workflows/create-version-branch.yml" || true
+
+      - name: 恢复工作流文件（确保本地版本不被覆盖）
+        run: |
+          # 将临时保存的工作流文件恢复
+          if [ -f ".github/workflows_temp/create-version-branch.yml" ]; then
+            mkdir -p .github/workflows
+            mv ".github/workflows_temp/create-version-branch.yml" ".github/workflows/"
+            # 如果文件有变化，创建一个提交保留本地版本
+            if ! git diff --quiet ".github/workflows/create-version-branch.yml"; then
+              git add ".github/workflows/create-version-branch.yml"
+              git commit -m "Preserve create-version-branch.yml from being overwritten"
+            fi
+            echo "已恢复并保护工作流文件"
+          fi
+
+      - name: Push changes to remote
         env:
           PAT: ${{ secrets.REPO_WORKFLOW_PAT }}
         run: |
-          if [ -z "$PAT" ]; then
-            echo "::error::该源包含 .github/workflows/*。请配置 REPO_WORKFLOW_PAT"
-            exit 1
-          fi
-
-      - name: Use PAT for push (override origin)
-        env:
-          PAT: ${{ secrets.REPO_WORKFLOW_PAT }}
-        run: |
-          if [ -n "$PAT" ]; then
-            git remote set-url origin "https://${PAT}@github.com/${GITHUB_REPOSITORY}.git"
-            echo "Using PAT to push."
-          else
-            echo "Using default push (no PAT)."
-          fi
-
-      - name: Skip if remote branch exists and not forcing
-        id: exists_check
-        run: |
-          set -euo pipefail
-          TARGET_BRANCH="${{ steps.fetch_source.outputs.target_branch }}"
+          TARGET_BRANCH="${{ steps.source_info.outputs.target_branch }}"
           FORCE="${{ github.event.inputs.force }}"
           
-          if git ls-remote --exit-code --heads origin "refs/heads/${TARGET_BRANCH}" >/dev/null 2>&1; then
-            if [ "$FORCE" = "true" ]; then
-              echo "exists=true"  >> "$GITHUB_OUTPUT"
-              echo "skip=false"   >> "$GITHUB_OUTPUT"
-              echo "force=true"   >> "$GITHUB_OUTPUT"
-              echo "同名远端分支已存在，启用强制覆盖。"
-            else
-              echo "exists=true"  >> "$GITHUB_OUTPUT"
-              echo "skip=true"    >> "$GITHUB_OUTPUT"
-              echo "force=false"  >> "$GITHUB_OUTPUT"
-              echo "同名远端分支已存在，未启用强制，跳过。"
-            fi
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "skip=false"   >> "$GITHUB_OUTPUT"
-            echo "force=${FORCE}" >> "$GITHUB_OUTPUT"
+          if [ -n "$PAT" ]; then
+            git remote set-url origin "https://${PAT}@github.com/${GITHUB_REPOSITORY}.git"
           fi
-
-      - name: Delete remote branch if forcing
-        if: ${{ steps.exists_check.outputs.skip == 'false' && steps.exists_check.outputs.force == 'true' }}
-        run: |
-          TARGET_BRANCH="${{ steps.fetch_source.outputs.target_branch }}"
-          git push origin ":refs/heads/${TARGET_BRANCH}" 2>/dev/null || true
-
-      - name: Create/update local branch
-        if: ${{ steps.exists_check.outputs.skip == 'false' }}
-        run: |
-          set -euo pipefail
-          TARGET_BRANCH="${{ steps.fetch_source.outputs.target_branch }}"
-          SHA="${{ steps.fetch_source.outputs.sha }}"
-          # 对于master分支模式：创建/更新本地latest分支，内容与上游master分支一致
-          git update-ref "refs/heads/${TARGET_BRANCH}" "$SHA"
-
-      - name: Push branch to remote
-        if: ${{ steps.exists_check.outputs.skip == 'false' }}
-        run: |
-          set -euo pipefail
-          TARGET_BRANCH="${{ steps.fetch_source.outputs.target_branch }}"
-          if git ls-remote --exit-code --heads origin "refs/heads/${TARGET_BRANCH}" >/dev/null 2>&1; then
-            git push --force-with-lease origin "refs/heads/${TARGET_BRANCH}:refs/heads/${TARGET_BRANCH}"
+          
+          if [ "$FORCE" = "true" ]; then
+            git push --force-with-lease origin "$TARGET_BRANCH"
           else
-            git push origin "refs/heads/${TARGET_BRANCH}:refs/heads/${TARGET_BRANCH}"
+            git push origin "$TARGET_BRANCH"
           fi
 
       - name: Checkout to target directory
-        if: ${{ steps.fetch_source.outputs.target_branch == 'latest' && steps.exists_check.outputs.skip == 'false' }}
+        if: ${{ steps.source_info.outputs.target_branch == 'latest' }}
         run: |
-          set -euo pipefail
-          # 本地latest分支内容来自上游master分支
-          # 将latest分支内容检出到指定目录（默认latest目录）
           TARGET_BRANCH="latest"
-          TARGET_DIR="${{ steps.fetch_source.outputs.target_dir }}"
+          TARGET_DIR="${{ needs.validate_inputs.outputs.target_dir }}"
           
           mkdir -p "${TARGET_DIR}"
           git --work-tree="${TARGET_DIR}" checkout "${TARGET_BRANCH}" -- .
           
-          echo "已将上游master分支内容同步到本地latest分支，并检出到 ${TARGET_DIR} 目录"
+          echo "已将上游内容增量更新到 ${TARGET_BRANCH} 分支，并检出到 ${TARGET_DIR} 目录"

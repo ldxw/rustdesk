@@ -25,7 +25,7 @@ on:
         required: true
         default: "rustdesk/rustdesk"
       target_directory:
-        description: "master分支拉取目标目录（仅当源类型为master_branch时有效）"
+        description: "本地存放目录（仅当源类型为master_branch时有效，默认latest）"
         required: false
         default: "latest"
 
@@ -60,7 +60,9 @@ jobs:
             exit 1
           fi
           
-          # 确定目标分支
+          # 确定目标分支：
+          # - 标签模式：使用标签名作为分支名
+          # - master分支模式：固定使用"latest"作为本地分支名
           if [ "$SOURCE_TYPE" = "tag" ]; then
             echo "target_branch=$VERSION" >> "$GITHUB_OUTPUT"
           else
@@ -87,7 +89,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --global --unset-all http.https://github.com/.extraheader || true
 
-      - name: Add upstream & fetch source (tag or master branch)
+      - name: Add upstream & fetch source
         id: fetch_source
         run: |
           set -euo pipefail
@@ -97,11 +99,14 @@ jobs:
           TARGET_DIR="${{ needs.validate_inputs.outputs.target_dir }}"
           TARGET_BRANCH="${{ needs.validate_inputs.outputs.target_branch }}"
           
+          # 明确区分：
+          # - 上游默认分支：master（从上游仓库拉取）
+          # - 本地目标分支：latest（存储上游master分支内容）
           if [ "$SOURCE_TYPE" = "tag" ]; then
             SOURCE_REF="refs/tags/${VERSION}"
             FETCH_REF="refs/tags/upstream-${VERSION}"
           else
-            SOURCE_REF="refs/heads/master"
+            SOURCE_REF="refs/heads/master"  # 上游默认分支为master
             FETCH_REF="refs/remotes/upstream/master"
           fi
 
@@ -111,12 +116,15 @@ jobs:
             git fetch --depth=1 upstream "${SOURCE_REF}:${FETCH_REF}" \
             || git fetch upstream "${SOURCE_REF}:${FETCH_REF}"
           else
+            # 拉取上游master分支最新内容
             git fetch upstream master
           fi
 
+          # 获取对应提交的SHA值
           if [ "$SOURCE_TYPE" = "tag" ]; then
             SHA="$(git rev-list -n 1 "${FETCH_REF}")"
           else
+            # 从上游master分支获取最新提交
             SHA="$(git rev-parse upstream/master)"
           fi
           
@@ -181,21 +189,22 @@ jobs:
             echo "force=${FORCE}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Delete remote branch if forcing (explicit refspec)
+      - name: Delete remote branch if forcing
         if: ${{ steps.exists_check.outputs.skip == 'false' && steps.exists_check.outputs.force == 'true' }}
         run: |
           TARGET_BRANCH="${{ steps.fetch_source.outputs.target_branch }}"
           git push origin ":refs/heads/${TARGET_BRANCH}" 2>/dev/null || true
 
-      - name: Create/update local branch ref to upstream source commit
+      - name: Create/update local branch
         if: ${{ steps.exists_check.outputs.skip == 'false' }}
         run: |
           set -euo pipefail
           TARGET_BRANCH="${{ steps.fetch_source.outputs.target_branch }}"
           SHA="${{ steps.fetch_source.outputs.sha }}"
+          # 对于master分支模式：创建/更新本地latest分支，内容与上游master分支一致
           git update-ref "refs/heads/${TARGET_BRANCH}" "$SHA"
 
-      - name: Push branch with explicit refspec
+      - name: Push branch to remote
         if: ${{ steps.exists_check.outputs.skip == 'false' }}
         run: |
           set -euo pipefail
@@ -206,14 +215,16 @@ jobs:
             git push origin "refs/heads/${TARGET_BRANCH}:refs/heads/${TARGET_BRANCH}"
           fi
 
-      - name: Checkout master branch to target directory
+      - name: Checkout to target directory
         if: ${{ steps.fetch_source.outputs.target_branch == 'latest' && steps.exists_check.outputs.skip == 'false' }}
         run: |
           set -euo pipefail
+          # 本地latest分支内容来自上游master分支
+          # 将latest分支内容检出到指定目录（默认latest目录）
           TARGET_BRANCH="latest"
           TARGET_DIR="${{ steps.fetch_source.outputs.target_dir }}"
           
           mkdir -p "${TARGET_DIR}"
           git --work-tree="${TARGET_DIR}" checkout "${TARGET_BRANCH}" -- .
           
-          echo "已将上游master分支内容拉取到本地latest分支，并检出到 ${TARGET_DIR} 目录"
+          echo "已将上游master分支内容同步到本地latest分支，并检出到 ${TARGET_DIR} 目录"

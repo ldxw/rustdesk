@@ -8,17 +8,14 @@ on:
         required: true
         type: choice
         options:
-          - label: "使用上游标签"
-            value: "tag"
-          - label: "使用上游master分支"
-            value: "master_branch"
+          - "tag"  # 使用上游标签
+          - "master_branch"  # 使用上游master分支
         default: "tag"
       version:
         description: "上游 Tag（如 1.4.1）"
         required: true
         default: "1.4.1"
-        # 当选择master分支时隐藏此选项
-        if: ${{ github.event.inputs.source_type == 'tag' }}
+        if: ${{ inputs.source_type == 'tag' }}
       force:
         description: "强制覆盖同名远端分支"
         required: true
@@ -32,8 +29,7 @@ on:
         description: "master分支拉取目标目录（仅master分支有效）"
         required: false
         default: "latest"
-        # 当选择标签时隐藏此选项
-        if: ${{ github.event.inputs.source_type == 'master_branch' }}
+        if: ${{ inputs.source_type == 'master_branch' }}
 
 permissions:
   contents: write
@@ -46,13 +42,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: false  # 关键：不要把 GITHUB_TOKEN 写进 extraheader
+          persist-credentials: false
 
       - name: Configure git identity & remove App extraheader
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # 清除 checkout 写入的 App 授权头（防止 push 仍用 GITHUB_TOKEN）
           git config --global --unset-all http.https://github.com/.extraheader || true
 
       - name: Add upstream & fetch source (tag or master branch)
@@ -64,30 +59,25 @@ jobs:
           UPSTREAM="${{ inputs.upstream_repo }}"
           TARGET_DIR="${{ inputs.target_directory }}"
           
-          # 确定源和目标分支名称
           if [ "$SOURCE_TYPE" = "tag" ]; then
             SOURCE_REF="refs/tags/${VERSION}"
             TARGET_BRANCH="${VERSION}"
             FETCH_REF="refs/tags/upstream-${VERSION}"
           else
-            SOURCE_REF="refs/heads/master"  # 拉取上游master分支
-            TARGET_BRANCH="latest"          # 本地使用latest分支
+            SOURCE_REF="refs/heads/master"
+            TARGET_BRANCH="latest"
             FETCH_REF="refs/remotes/upstream/master"
           fi
 
           git remote add upstream "https://github.com/${UPSTREAM}.git" || true
           
-          # 拉取源
           if [ "$SOURCE_TYPE" = "tag" ]; then
-            # 抓取标签
             git fetch --depth=1 upstream "${SOURCE_REF}:${FETCH_REF}" \
             || git fetch upstream "${SOURCE_REF}:${FETCH_REF}"
           else
-            # 抓取上游master分支
             git fetch upstream master
           fi
 
-          # 获取提交SHA
           if [ "$SOURCE_TYPE" = "tag" ]; then
             SHA="$(git rev-list -n 1 "${FETCH_REF}")"
           else
@@ -103,7 +93,6 @@ jobs:
           echo "target_branch=$TARGET_BRANCH" >> "$GITHUB_OUTPUT"
           echo "target_dir=$TARGET_DIR" >> "$GITHUB_OUTPUT"
 
-          # 检查是否包含workflows
           if git ls-tree -r --name-only "$SHA" | grep -q '^.github/workflows/'; then
             echo "has_workflows=true"  >> "$GITHUB_OUTPUT"
           else
@@ -116,7 +105,7 @@ jobs:
           PAT: ${{ secrets.REPO_WORKFLOW_PAT }}
         run: |
           if [ -z "$PAT" ]; then
-            echo "::error::该源包含 .github/workflows/*。GITHUB_TOKEN 没有 workflows 权限，推送会被拒。请在仓库 Secrets 配置 REPO_WORKFLOW_PAT（classic: 勾选 repo + workflow；fine-grained: Contents:RW + Actions:RW）。"
+            echo "::error::该源包含 .github/workflows/*。请配置 REPO_WORKFLOW_PAT"
             exit 1
           fi
 
@@ -124,7 +113,6 @@ jobs:
         env:
           PAT: ${{ secrets.REPO_WORKFLOW_PAT }}
         run: |
-          # 如果设置了 PAT，强制使用 PAT 覆盖 origin
           if [ -n "$PAT" ]; then
             git remote set-url origin "https://${PAT}@github.com/${GITHUB_REPOSITORY}.git"
             echo "Using PAT to push."
@@ -169,10 +157,9 @@ jobs:
           set -euo pipefail
           TARGET_BRANCH="${{ steps.fetch_source.outputs.target_branch }}"
           SHA="${{ steps.fetch_source.outputs.sha }}"
-          # 直接更新分支引用（不切换工作区）
           git update-ref "refs/heads/${TARGET_BRANCH}" "$SHA"
 
-      - name: Push branch with explicit refspec (avoid tag/branch ambiguity)
+      - name: Push branch with explicit refspec
         if: ${{ steps.exists_check.outputs.skip == 'false' }}
         run: |
           set -euo pipefail
@@ -187,13 +174,10 @@ jobs:
         if: ${{ steps.fetch_source.outputs.target_branch == 'latest' && steps.exists_check.outputs.skip == 'false' }}
         run: |
           set -euo pipefail
-          TARGET_BRANCH="latest"  # 使用latest分支
+          TARGET_BRANCH="latest"
           TARGET_DIR="${{ steps.fetch_source.outputs.target_dir }}"
           
-          # 创建目标目录
           mkdir -p "${TARGET_DIR}"
-          
-          # 检出latest分支(包含从上游master拉取的内容)到目标目录
           git --work-tree="${TARGET_DIR}" checkout "${TARGET_BRANCH}" -- .
           
           echo "已将上游master分支内容拉取到本地latest分支，并检出到 ${TARGET_DIR} 目录"

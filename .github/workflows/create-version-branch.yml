@@ -80,15 +80,19 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.validate_inputs.outputs.target_branch }}
 
-      - name: 保存工作流文件到临时位置（防止被覆盖）
+      - name: 暂存工作流文件（防止被覆盖）
+        id: stash_workflow
         run: |
-          # 创建临时目录保存当前工作流文件
-          mkdir -p .github/workflows_temp
-          if [ -f ".github/workflows/create-version-branch.yml" ]; then
-            cp ".github/workflows/create-version-branch.yml" ".github/workflows_temp/"
-            echo "已备份工作流文件"
+          WORKFLOW_FILE=".github/workflows/create-version-branch.yml"
+          # 检查工作流文件是否存在
+          if [ -f "$WORKFLOW_FILE" ]; then
+            # 暂存工作流文件内容
+            git stash push -u -- "$WORKFLOW_FILE"
+            echo "stashed=true" >> "$GITHUB_OUTPUT"
+            echo "已暂存工作流文件"
           else
-            echo "工作流文件不存在，无需备份"
+            echo "stashed=false" >> "$GITHUB_OUTPUT"
+            echo "工作流文件不存在，无需暂存"
           fi
 
       - name: Configure git identity
@@ -147,24 +151,23 @@ jobs:
           
           git fetch upstream
           
-          # 合并时排除工作流文件，防止被上游版本覆盖
+          # 增量合并上游变更，冲突时自动采用上游版本
           git merge --no-ff -X theirs "upstream/${SOURCE_REF#refs/heads/}" \
-            -m "Merge upstream $SOURCE_NAME into $TARGET_BRANCH (auto-resolve conflicts with upstream version)" \
-            --exclude ".github/workflows/create-version-branch.yml" || true
+            -m "Merge upstream $SOURCE_NAME into $TARGET_BRANCH (auto-resolve conflicts with upstream version)" || true
 
       - name: 恢复工作流文件（确保本地版本不被覆盖）
+        if: ${{ steps.stash_workflow.outputs.stashed == 'true' }}
         run: |
-          # 将临时保存的工作流文件恢复
-          if [ -f ".github/workflows_temp/create-version-branch.yml" ]; then
-            mkdir -p .github/workflows
-            mv ".github/workflows_temp/create-version-branch.yml" ".github/workflows/"
-            # 如果文件有变化，创建一个提交保留本地版本
-            if ! git diff --quiet ".github/workflows/create-version-branch.yml"; then
-              git add ".github/workflows/create-version-branch.yml"
-              git commit -m "Preserve create-version-branch.yml from being overwritten"
-            fi
-            echo "已恢复并保护工作流文件"
+          WORKFLOW_FILE=".github/workflows/create-version-branch.yml"
+          # 恢复暂存的工作流文件
+          git stash pop --quiet
+          
+          # 如果文件有变化，创建一个提交保留本地版本
+          if ! git diff --quiet HEAD -- "$WORKFLOW_FILE"; then
+            git add "$WORKFLOW_FILE"
+            git commit -m "Preserve create-version-branch.yml from being overwritten"
           fi
+          echo "已恢复并保护工作流文件"
 
       - name: Push changes to remote
         env:

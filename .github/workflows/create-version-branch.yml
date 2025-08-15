@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "上游 Tag（如 1.4.1 ）"
+        description: "上游 Tag（如 1.4.1）"
         required: true
         default: "1.4.1"
       force:
@@ -42,7 +42,7 @@ jobs:
           UPSTREAM="${{ inputs.upstream_repo }}"
 
           git remote add upstream "https://github.com/${UPSTREAM}.git" || true
-          # 只抓取目标 tag（优先浅抓取，失败再全量该引用）
+          # 只抓取目标 tag -> 存到 refs/tags/upstream-<version>，避免与本地同名 tag 冲突
           git fetch --depth=1 upstream "refs/tags/${VERSION}:refs/tags/upstream-${VERSION}" \
           || git fetch upstream "refs/tags/${VERSION}:refs/tags/upstream-${VERSION}"
 
@@ -54,20 +54,20 @@ jobs:
           fi
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
-          # 检查该提交中是否包含工作流目录（决定是否需要 PAT）
+          # 该提交是否包含 workflows：决定是否需要 PAT
           if git ls-tree -r --name-only "$SHA" | grep -q '^.github/workflows/'; then
             echo "has_workflows=true"  >> "$GITHUB_OUTPUT"
           else
             echo "has_workflows=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Ensure PAT if workflows present in the tag
+      - name: Ensure PAT if workflows exist in the tag
         if: ${{ steps.fetch_tag.outputs.has_workflows == 'true' }}
         env:
           PAT: ${{ secrets.REPO_WORKFLOW_PAT }}
         run: |
           if [ -z "$PAT" ]; then
-            echo "::error::该 tag 包含 .github/workflows/*。GITHUB_TOKEN 没有 workflows 权限，推送会被拒。请在仓库 Secrets 新增 REPO_WORKFLOW_PAT（需含 repo + workflow 权限）。"
+            echo "::error::该 tag 包含 .github/workflows/*。GITHUB_TOKEN 没有 workflows 权限，推送会被拒。请在仓库 Secrets 配置 REPO_WORKFLOW_PAT（需含 repo + workflow 权限）。"
             exit 1
           fi
 
@@ -88,7 +88,7 @@ jobs:
           set -euo pipefail
           VERSION="${{ inputs.version }}"
           FORCE="${{ inputs.force }}"
-          if git ls-remote --exit-code --heads origin "$VERSION" >/dev/null 2>&1; then
+          if git ls-remote --exit-code --heads origin "refs/heads/${VERSION}" >/dev/null 2>&1; then
             if [ "$FORCE" = "true" ]; then
               echo "exists=true"  >> "$GITHUB_OUTPUT"
               echo "skip=false"   >> "$GITHUB_OUTPUT"
@@ -106,27 +106,32 @@ jobs:
             echo "force=${FORCE}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Delete remote branch if forcing
+      - name: Delete remote branch if forcing (explicit refspec)
         if: ${{ steps.exists_check.outputs.skip == 'false' && steps.exists_check.outputs.force == 'true' }}
         run: |
           VERSION="${{ inputs.version }}"
-          git push origin --delete "$VERSION" 2>/dev/null || true
+          # 显式删除远端分支（避免删除到 tag）
+          git push origin ":refs/heads/${VERSION}" 2>/dev/null || true
 
-      - name: Create/update version branch pointing to upstream tag commit
+      - name: Create/update local branch ref to upstream tag commit
         if: ${{ steps.exists_check.outputs.skip == 'false' }}
         run: |
           set -euo pipefail
           VERSION="${{ inputs.version }}"
           SHA="${{ steps.fetch_tag.outputs.sha }}"
+          # 直接更新分支引用，避免工作区切换；显式使用 refs/heads
+          git update-ref "refs/heads/${VERSION}" "$SHA"
 
-          # 在本地创建/更新分支（不改工作区文件），指向上游该 tag 的提交
-          git branch -f "$VERSION" "$SHA" || git branch "$VERSION" "$SHA"
-
-          # 推送（已存在用 --force-with-lease；新建普通推送）
-          if git ls-remote --exit-code --heads origin "$VERSION" >/dev/null 2>&1; then
-            git push origin "$VERSION" --force-with-lease
+      - name: Push branch with explicit refspec (no ambiguity)
+        if: ${{ steps.exists_check.outputs.skip == 'false' }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.version }}"
+          # 推送时使用全限定 refspec，避免与 tag 同名引起 "matches more than one"
+          if git ls-remote --exit-code --heads origin "refs/heads/${VERSION}" >/dev/null 2>&1; then
+            git push --force-with-lease origin "refs/heads/${VERSION}:refs/heads/${VERSION}"
           else
-            git push origin "$VERSION"
+            git push origin "refs/heads/${VERSION}:refs/heads/${VERSION}"
           fi
 
       - name: Done

@@ -1,0 +1,134 @@
+name: 从上游标签创建版本分支
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "上游 Tag（如 1.4.1 ）"
+        required: true
+        default: "1.4.1"
+      force:
+        description: "强制覆盖同名远端分支"
+        required: true
+        type: boolean
+        default: false
+      upstream_repo:
+        description: "上游仓库（owner/repo）"
+        required: true
+        default: "rustdesk/rustdesk"
+
+permissions:
+  contents: write
+
+jobs:
+  create_version_branch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork (this repo)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream & fetch tag
+        id: fetch_tag
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.version }}"
+          UPSTREAM="${{ inputs.upstream_repo }}"
+
+          git remote add upstream "https://github.com/${UPSTREAM}.git" || true
+          # 只抓取目标 tag（优先浅抓取，失败再全量该引用）
+          git fetch --depth=1 upstream "refs/tags/${VERSION}:refs/tags/upstream-${VERSION}" \
+          || git fetch upstream "refs/tags/${VERSION}:refs/tags/upstream-${VERSION}"
+
+          # 解析 tag 指向的提交（兼容轻量/注释/签名 tag）
+          SHA="$(git rev-list -n 1 "refs/tags/upstream-${VERSION}")"
+          if [ -z "$SHA" ]; then
+            echo "::error::上游 ${UPSTREAM} 不存在 tag ${VERSION}"
+            exit 1
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+          # 检查该提交中是否包含工作流目录（决定是否需要 PAT）
+          if git ls-tree -r --name-only "$SHA" | grep -q '^.github/workflows/'; then
+            echo "has_workflows=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "has_workflows=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ensure PAT if workflows present in the tag
+        if: ${{ steps.fetch_tag.outputs.has_workflows == 'true' }}
+        env:
+          PAT: ${{ secrets.REPO_WORKFLOW_PAT }}
+        run: |
+          if [ -z "$PAT" ]; then
+            echo "::error::该 tag 包含 .github/workflows/*。GITHUB_TOKEN 没有 workflows 权限，推送会被拒。请在仓库 Secrets 新增 REPO_WORKFLOW_PAT（需含 repo + workflow 权限）。"
+            exit 1
+          fi
+
+      - name: Use PAT for push when provided
+        env:
+          PAT: ${{ secrets.REPO_WORKFLOW_PAT }}
+        run: |
+          if [ -n "$PAT" ]; then
+            git remote set-url origin "https://${PAT}@github.com/${GITHUB_REPOSITORY}.git"
+            echo "Using PAT to push."
+          else
+            echo "Using default GITHUB_TOKEN to push."
+          fi
+
+      - name: Skip if remote branch exists and not forcing
+        id: exists_check
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.version }}"
+          FORCE="${{ inputs.force }}"
+          if git ls-remote --exit-code --heads origin "$VERSION" >/dev/null 2>&1; then
+            if [ "$FORCE" = "true" ]; then
+              echo "exists=true"  >> "$GITHUB_OUTPUT"
+              echo "skip=false"   >> "$GITHUB_OUTPUT"
+              echo "force=true"   >> "$GITHUB_OUTPUT"
+              echo "同名远端分支已存在，启用强制覆盖。"
+            else
+              echo "exists=true"  >> "$GITHUB_OUTPUT"
+              echo "skip=true"    >> "$GITHUB_OUTPUT"
+              echo "force=false"  >> "$GITHUB_OUTPUT"
+              echo "同名远端分支已存在，未启用强制，跳过。"
+            fi
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "skip=false"   >> "$GITHUB_OUTPUT"
+            echo "force=${FORCE}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Delete remote branch if forcing
+        if: ${{ steps.exists_check.outputs.skip == 'false' && steps.exists_check.outputs.force == 'true' }}
+        run: |
+          VERSION="${{ inputs.version }}"
+          git push origin --delete "$VERSION" 2>/dev/null || true
+
+      - name: Create/update version branch pointing to upstream tag commit
+        if: ${{ steps.exists_check.outputs.skip == 'false' }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.version }}"
+          SHA="${{ steps.fetch_tag.outputs.sha }}"
+
+          # 在本地创建/更新分支（不改工作区文件），指向上游该 tag 的提交
+          git branch -f "$VERSION" "$SHA" || git branch "$VERSION" "$SHA"
+
+          # 推送（已存在用 --force-with-lease；新建普通推送）
+          if git ls-remote --exit-code --heads origin "$VERSION" >/dev/null 2>&1; then
+            git push origin "$VERSION" --force-with-lease
+          else
+            git push origin "$VERSION"
+          fi
+
+      - name: Done
+        if: ${{ steps.exists_check.outputs.skip == 'false' }}
+        run: echo "版本分支 ${{ inputs.version }} 已指向上游提交 ${{ steps.fetch_tag.outputs.sha }}"

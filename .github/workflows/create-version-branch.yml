@@ -4,18 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       source_type:
-        description: "源类型"
+        description: "源类型 (tag = 使用上游标签, master_branch = 使用上游master分支)"
         required: true
         type: choice
         options:
-          - "tag"  # 使用上游标签
-          - "master_branch"  # 使用上游master分支
+          - "tag"
+          - "master_branch"
         default: "tag"
       version:
-        description: "上游 Tag（如 1.4.1）"
-        required: true
+        description: "上游 Tag（如 1.4.1，仅当源类型为tag时有效）"
+        required: false
         default: "1.4.1"
-        if: ${{ inputs.source_type == 'tag' }}
       force:
         description: "强制覆盖同名远端分支"
         required: true
@@ -26,16 +25,54 @@ on:
         required: true
         default: "rustdesk/rustdesk"
       target_directory:
-        description: "master分支拉取目标目录（仅master分支有效）"
+        description: "master分支拉取目标目录（仅当源类型为master_branch时有效）"
         required: false
         default: "latest"
-        if: ${{ inputs.source_type == 'master_branch' }}
 
 permissions:
   contents: write
 
 jobs:
+  validate_inputs:
+    runs-on: ubuntu-latest
+    outputs:
+      valid: ${{ steps.check.outputs.valid }}
+      target_branch: ${{ steps.check.outputs.target_branch }}
+      target_dir: ${{ steps.check.outputs.target_dir }}
+    steps:
+      - id: check
+        run: |
+          set -euo pipefail
+          SOURCE_TYPE="${{ github.event.inputs.source_type }}"
+          VERSION="${{ github.event.inputs.version }}"
+          TARGET_DIR="${{ github.event.inputs.target_directory }}"
+          
+          # 验证输入
+          if [ "$SOURCE_TYPE" = "tag" ] && [ -z "$VERSION" ]; then
+            echo "::error::当源类型为tag时，版本号不能为空"
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          
+          if [ "$SOURCE_TYPE" = "master_branch" ] && [ -z "$TARGET_DIR" ]; then
+            echo "::error::当源类型为master_branch时，目标目录不能为空"
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          
+          # 确定目标分支
+          if [ "$SOURCE_TYPE" = "tag" ]; then
+            echo "target_branch=$VERSION" >> "$GITHUB_OUTPUT"
+          else
+            echo "target_branch=latest" >> "$GITHUB_OUTPUT"
+          fi
+          
+          echo "target_dir=$TARGET_DIR" >> "$GITHUB_OUTPUT"
+          echo "valid=true" >> "$GITHUB_OUTPUT"
+
   create_version_branch:
+    needs: validate_inputs
+    if: ${{ needs.validate_inputs.outputs.valid == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout fork (this repo) without persisting credentials
@@ -54,18 +91,17 @@ jobs:
         id: fetch_source
         run: |
           set -euo pipefail
-          SOURCE_TYPE="${{ inputs.source_type }}"
-          VERSION="${{ inputs.version }}"
-          UPSTREAM="${{ inputs.upstream_repo }}"
-          TARGET_DIR="${{ inputs.target_directory }}"
+          SOURCE_TYPE="${{ github.event.inputs.source_type }}"
+          VERSION="${{ github.event.inputs.version }}"
+          UPSTREAM="${{ github.event.inputs.upstream_repo }}"
+          TARGET_DIR="${{ needs.validate_inputs.outputs.target_dir }}"
+          TARGET_BRANCH="${{ needs.validate_inputs.outputs.target_branch }}"
           
           if [ "$SOURCE_TYPE" = "tag" ]; then
             SOURCE_REF="refs/tags/${VERSION}"
-            TARGET_BRANCH="${VERSION}"
             FETCH_REF="refs/tags/upstream-${VERSION}"
           else
             SOURCE_REF="refs/heads/master"
-            TARGET_BRANCH="latest"
             FETCH_REF="refs/remotes/upstream/master"
           fi
 
@@ -125,7 +161,7 @@ jobs:
         run: |
           set -euo pipefail
           TARGET_BRANCH="${{ steps.fetch_source.outputs.target_branch }}"
-          FORCE="${{ inputs.force }}"
+          FORCE="${{ github.event.inputs.force }}"
           
           if git ls-remote --exit-code --heads origin "refs/heads/${TARGET_BRANCH}" >/dev/null 2>&1; then
             if [ "$FORCE" = "true" ]; then

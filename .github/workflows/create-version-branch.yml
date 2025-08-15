@@ -24,15 +24,18 @@ jobs:
   create_version_branch:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout fork (this repo)
+      - name: Checkout fork (this repo) without persisting credentials
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false  # 关键：不要把 GITHUB_TOKEN 写进 extraheader
 
-      - name: Configure git identity
+      - name: Configure git identity & remove App extraheader
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # 清除 checkout 写入的 App 授权头（防止 push 仍用 GITHUB_TOKEN）
+          git config --global --unset-all http.https://github.com/.extraheader || true
 
       - name: Add upstream & fetch tag
         id: fetch_tag
@@ -42,11 +45,10 @@ jobs:
           UPSTREAM="${{ inputs.upstream_repo }}"
 
           git remote add upstream "https://github.com/${UPSTREAM}.git" || true
-          # 只抓取目标 tag -> 存到 refs/tags/upstream-<version>，避免与本地同名 tag 冲突
+          # 只抓取目标 tag 到 refs/tags/upstream-<version>，防止与本地同名 tag 混淆
           git fetch --depth=1 upstream "refs/tags/${VERSION}:refs/tags/upstream-${VERSION}" \
           || git fetch upstream "refs/tags/${VERSION}:refs/tags/upstream-${VERSION}"
 
-          # 解析 tag 指向的提交（兼容轻量/注释/签名 tag）
           SHA="$(git rev-list -n 1 "refs/tags/upstream-${VERSION}")"
           if [ -z "$SHA" ]; then
             echo "::error::上游 ${UPSTREAM} 不存在 tag ${VERSION}"
@@ -54,7 +56,7 @@ jobs:
           fi
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
-          # 该提交是否包含 workflows：决定是否需要 PAT
+          # 该提交是否包含 workflows：决定是否必须 PAT
           if git ls-tree -r --name-only "$SHA" | grep -q '^.github/workflows/'; then
             echo "has_workflows=true"  >> "$GITHUB_OUTPUT"
           else
@@ -67,19 +69,20 @@ jobs:
           PAT: ${{ secrets.REPO_WORKFLOW_PAT }}
         run: |
           if [ -z "$PAT" ]; then
-            echo "::error::该 tag 包含 .github/workflows/*。GITHUB_TOKEN 没有 workflows 权限，推送会被拒。请在仓库 Secrets 配置 REPO_WORKFLOW_PAT（需含 repo + workflow 权限）。"
+            echo "::error::该 tag 包含 .github/workflows/*。GITHUB_TOKEN 没有 workflows 权限，推送会被拒。请在仓库 Secrets 配置 REPO_WORKFLOW_PAT（classic: 勾选 repo + workflow；fine-grained: Contents:RW + Actions:RW）。"
             exit 1
           fi
 
-      - name: Use PAT for push when provided
+      - name: Use PAT for push (override origin)
         env:
           PAT: ${{ secrets.REPO_WORKFLOW_PAT }}
         run: |
+          # 如果设置了 PAT，强制使用 PAT 覆盖 origin
           if [ -n "$PAT" ]; then
             git remote set-url origin "https://${PAT}@github.com/${GITHUB_REPOSITORY}.git"
             echo "Using PAT to push."
           else
-            echo "Using default GITHUB_TOKEN to push."
+            echo "Using default push (no PAT)."
           fi
 
       - name: Skip if remote branch exists and not forcing
@@ -110,7 +113,6 @@ jobs:
         if: ${{ steps.exists_check.outputs.skip == 'false' && steps.exists_check.outputs.force == 'true' }}
         run: |
           VERSION="${{ inputs.version }}"
-          # 显式删除远端分支（避免删除到 tag）
           git push origin ":refs/heads/${VERSION}" 2>/dev/null || true
 
       - name: Create/update local branch ref to upstream tag commit
@@ -119,21 +121,16 @@ jobs:
           set -euo pipefail
           VERSION="${{ inputs.version }}"
           SHA="${{ steps.fetch_tag.outputs.sha }}"
-          # 直接更新分支引用，避免工作区切换；显式使用 refs/heads
+          # 直接更新分支引用（不切换工作区）
           git update-ref "refs/heads/${VERSION}" "$SHA"
 
-      - name: Push branch with explicit refspec (no ambiguity)
+      - name: Push branch with explicit refspec (avoid tag/branch ambiguity)
         if: ${{ steps.exists_check.outputs.skip == 'false' }}
         run: |
           set -euo pipefail
           VERSION="${{ inputs.version }}"
-          # 推送时使用全限定 refspec，避免与 tag 同名引起 "matches more than one"
           if git ls-remote --exit-code --heads origin "refs/heads/${VERSION}" >/dev/null 2>&1; then
             git push --force-with-lease origin "refs/heads/${VERSION}:refs/heads/${VERSION}"
           else
             git push origin "refs/heads/${VERSION}:refs/heads/${VERSION}"
           fi
-
-      - name: Done
-        if: ${{ steps.exists_check.outputs.skip == 'false' }}
-        run: echo "版本分支 ${{ inputs.version }} 已指向上游提交 ${{ steps.fetch_tag.outputs.sha }}"

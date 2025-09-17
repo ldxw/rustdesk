@@ -1,4 +1,4 @@
 [submodule "libs/hbb_common"]
 	path = libs/hbb_common
-	url = git@github.com:ldxw/rustdesk_hbb_common.git
+	url = https://github.com/ldxw/rustdesk_hbb_common
 	branch = main

@@ -12,7 +12,7 @@ on:
           - "master_branch"
         default: "tag"
       version:
-        description: "上游 Tag（如 1.4.1，仅当源类型为tag时有效）"
+        description: "上游 Tag（如 1.4.2，仅当源类型为tag时有效）"
         required: false
         default: "1.4.2"
       force:
@@ -78,7 +78,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          # 不要在此处用 ref 检出 upstream 才有的 tag/分支
+          # 注意：不要在这里用 ref 去检出 upstream 才有的 tag/分支
 
       - name: 暂存工作流文件（防止被覆盖）
         id: stash_workflow
@@ -106,7 +106,8 @@ jobs:
           set -euo pipefail
           UPSTREAM="${{ github.event.inputs.upstream_repo }}"
           git remote add upstream "https://github.com/${UPSTREAM}.git" || true
-          git fetch upstream --tags
+          # 仅抓分支引用，不抓取任何 tag，避免 clobber
+          git fetch upstream --no-tags
 
       - name: Determine source and target information
         id: source_info
@@ -119,7 +120,7 @@ jobs:
           if [ "$SOURCE_TYPE" = "tag" ]; then
             echo "is_tag=true" >> "$GITHUB_OUTPUT"
             echo "source_name=tag ${VERSION}" >> "$GITHUB_OUTPUT"
-            echo "source_ref=${VERSION}" >> "$GITHUB_OUTPUT"   # 仅保存裸 tag 名
+            echo "source_ref=${VERSION}" >> "$GITHUB_OUTPUT"   # 裸 tag 名
           else
             echo "is_tag=false" >> "$GITHUB_OUTPUT"
             echo "source_name=master branch" >> "$GITHUB_OUTPUT"
@@ -146,11 +147,16 @@ jobs:
           IS_TAG="${{ steps.source_info.outputs.is_tag }}"
           SRC="${{ steps.source_info.outputs.source_ref }}"
 
-          git fetch upstream --tags
+          # 只抓需要的引用，避免 clobber 已有 tag
+          git fetch upstream --no-tags
 
           if [ "$IS_TAG" = "true" ]; then
-            # 拉取并以 tag 为起点创建/重置分支
-            git fetch upstream tag "$SRC" || true
+            # 仅抓取目标 tag（必要时可加 --force 覆盖本地同名 tag）
+            git fetch --no-tags upstream tag "$SRC" || true
+            if ! git rev-parse -q --verify "refs/tags/$SRC" >/dev/null; then
+              echo "::error::未在 upstream 获取到 tag $SRC"
+              exit 1
+            fi
             git checkout -B "$TARGET_BRANCH" "refs/tags/$SRC"
             git commit --allow-empty -m "Init $TARGET_BRANCH from upstream tag $SRC" || true
           else
@@ -169,10 +175,14 @@ jobs:
           SOURCE_NAME="${{ steps.source_info.outputs.source_name }}"
 
           git checkout "$TARGET_BRANCH"
-          git fetch upstream --tags
+          git fetch upstream --no-tags
 
           if [ "$IS_TAG" = "true" ]; then
-            git fetch upstream tag "$SRC" || true
+            git fetch --no-tags upstream tag "$SRC" || true
+            if ! git rev-parse -q --verify "refs/tags/$SRC" >/dev/null; then
+              echo "::error::未在 upstream 获取到 tag $SRC"
+              exit 1
+            fi
             git merge --no-ff -X theirs "refs/tags/$SRC" \
               -m "Merge upstream $SOURCE_NAME into $TARGET_BRANCH (auto-resolve with upstream)" || true
           else

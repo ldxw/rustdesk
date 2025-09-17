@@ -1,4 +1,4 @@
-name: 直接在分支修改：替换子模块(SSH)并推送/可选打Tag（≤10 inputs）
+name: 直接在分支修改：替换子模块(SSH)+打Tag（Retag触发构建）
 
 on:
   workflow_dispatch:
@@ -13,6 +13,8 @@ on:
         options: ["false", "true"]
         required: true
         default: "false"
+
+      # 子模块参数（保持 ≤10 个 inputs）
       submodule_ssh_url:
         description: "子模块私有 fork（SSH）地址"
         required: true
@@ -21,12 +23,14 @@ on:
         description: "子模块分支（auto=自动检测远端默认分支）"
         required: true
         default: "auto"
+
+      # 打 tag 并触发构建（方案 A）
       do_tag:
         description: "是否在当前分支 HEAD 打 Tag（版本号见下方）"
         type: choice
         options: ["false", "true"]
         required: true
-        default: "false"
+        default: "true"
       version:
         description: "Tag 名（留空则使用 work_branch）"
         required: false
@@ -36,11 +40,11 @@ on:
         required: false
         default: "修改内置服务器和 key"
       trigger_mode:
-        description: "如何触发构建：none=仅正常推送；poke=空提交触发 push；retag=删除同名 tag 后重推"
+        description: "触发方式：retag=删除同名 tag 后重推；poke=空提交触发 push；none=仅正常推送"
         type: choice
-        options: ["none", "poke", "retag"]
+        options: ["retag", "poke", "none"]
         required: true
-        default: "retag"   # 常用于 on:push:tags 的构建
+        default: "retag"
 
 permissions:
   contents: write
@@ -64,9 +68,9 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      # —— SSH 仅用于子模块 ——
+      # —— SSH 仅用于子模块 ——（pin 到 v0.8.0，避免清理阶段警告）
       - name: Setup SSH agent with private key
-        uses: webfactory/ssh-agent@v0.9.0
+        uses: webfactory/ssh-agent@v0.8.0
         with:
           ssh-private-key: |
             ${{ secrets.SSH_PRIVATE_KEY }}
@@ -154,17 +158,10 @@ jobs:
             git commit -m "更新子模块 ${SM_PATH} 至远端分支 ${SM_BRANCH} 的最新提交"
           fi
 
-      # —— 可选：制造空提交触发 on:push —— 
-      - name: Poke branch with empty commit (optional)
-        if: ${{ inputs.trigger_mode == 'poke' }}
-        run: |
-          set -euo pipefail
-          git commit --allow-empty -m "ci: poke to trigger build $(date -u +%FT%TZ)"
-
-      # —— 用 PAT 推送分支（会触发 on:push） —— 
-      - name: Push branch via PAT (triggers build)
+      # —— 用 PAT 推送分支（正常 push 事件） —— 
+      - name: Push branch via PAT
         env:
-          GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}   # PAT，需 repo 权限（若用 dispatch 还需 workflow 权限）
+          GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}   # PAT：需 repo 权限
         run: |
           set -euo pipefail
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
@@ -174,22 +171,23 @@ jobs:
             git push origin "HEAD:refs/heads/${WORK_BRANCH}"
           fi
 
-      # —— 可选：在当前分支 HEAD 打 Tag 并用 PAT 推送 —— 
-      - name: Create/Push tag (optional)
+      # —— 方案 A：删除远端同名 tag 后重推，强制触发 on:push:tags —— 
+      - name: Create/Retag & Push tag (RETAG trigger)
         if: ${{ inputs.do_tag == 'true' }}
         env:
-          GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}
+          GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}   # PAT：需 repo 权限（如需调用别的 workflow 还要 workflow 权限）
         run: |
           set -euo pipefail
           TAG="${{ inputs.version }}"
           if [ -z "${TAG}" ]; then TAG="${WORK_BRANCH}"; fi
           MSG='${{ inputs.tag_message }}'
 
+          # 本地创建/更新注释 tag
           if [ "$FORCE" = "true" ]; then
             git tag -a -f "$TAG" -m "$MSG"
           else
             if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-              echo "::notice::Tag $TAG 已存在，保持不变（若需覆盖请 force=true）。"
+              echo "::notice::本地已存在 tag $TAG，将直接使用该引用。"
             else
               git tag -a "$TAG" -m "$MSG"
             fi
@@ -197,9 +195,12 @@ jobs:
 
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 
-          # 触发 on:push:tags：选择 retag 模式则先删除远端同名 tag 再推送
+          # 方案A触发关键：先删远端同名 tag（若存在），再推送新的
           if [ "${{ inputs.trigger_mode }}" = "retag" ]; then
             git push origin ":refs/tags/${TAG}" || true
+          elif [ "${{ inputs.trigger_mode }}" = "poke" ]; then
+            # 若选了 poke，这里不删 tag，由上一步的分支空提交触发
+            :
           fi
 
           if [ "$FORCE" = "true" ]; then

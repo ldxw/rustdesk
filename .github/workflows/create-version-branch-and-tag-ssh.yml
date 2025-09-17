@@ -1,4 +1,4 @@
-name: 直接在分支修改：替换子模块(SSH)并推送/可选打Tag（Token推送）
+name: 直接在分支修改：替换子模块(SSH)并推送/可选打Tag（PAT触发构建）
 
 on:
   workflow_dispatch:
@@ -167,10 +167,10 @@ jobs:
             git commit -m "更新子模块 ${SM_PATH} 至远端分支 ${SM_BRANCH} 的最新提交"
           fi
 
-      # —— 用 Token 推送分支（显式 refs/heads，避免与同名 tag 冲突） ——
-      - name: Push branch via token (recommended)
+      # —— 用 PAT 推送分支（显式 refs/heads，避免与同名 tag 冲突） ——
+      - name: Push branch via PAT (triggers build)
         env:
-          GH_TOKEN: ${{ github.token }}   # 或改为: secrets.REPO_WORKFLOW_PAT
+          GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}   # PAT，需至少 repo 权限
         run: |
           set -euo pipefail
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
@@ -180,11 +180,11 @@ jobs:
             git push origin "HEAD:refs/heads/${WORK_BRANCH}"
           fi
 
-      # —— 可选：在当前分支 HEAD 打 Tag 并用 Token 推送 ——
-      - name: Create/Push tag (optional)
+      # —— 可选：在当前分支 HEAD 打 Tag 并用 PAT 推送 ——
+      - name: Create/Push tag (optional, triggers build)
         if: ${{ inputs.do_tag == 'true' }}
         env:
-          GH_TOKEN: ${{ github.token }}   # 或改为: secrets.REPO_WORKFLOW_PAT
+          GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}   # PAT，需至少 repo 权限
         run: |
           set -euo pipefail
           TAG="${{ inputs.version }}"

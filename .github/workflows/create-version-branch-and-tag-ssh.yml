@@ -1,4 +1,4 @@
-name: 直接在分支修改：替换子模块(SSH)并推送/可选打Tag（PAT触发构建）
+name: 直接在分支修改：替换子模块(SSH)并推送/可选打Tag（可触发构建）
 
 on:
   workflow_dispatch:
@@ -13,6 +13,7 @@ on:
         options: ["false", "true"]
         required: true
         default: "false"
+
       # 子模块参数
       submodule_name:
         description: ".gitmodules 中的子模块名（方括号里的名称）"
@@ -30,6 +31,7 @@ on:
         description: "子模块需要跟踪的分支（填 auto 则自动检测远端默认分支）"
         required: true
         default: "auto"
+
       # 可选打 tag
       do_tag:
         description: "是否在当前分支 HEAD 打同名/指定版本 Tag"
@@ -45,6 +47,28 @@ on:
         description: "Tag 注释信息"
         required: false
         default: "修改内置服务器和 key"
+
+      # —— 构建触发选项（3 选 1，用哪个就设为 true） ——
+      retag:
+        description: "删除远端同名 tag 后重推（触发 on:push:tags）"
+        type: choice
+        options: ["false", "true"]
+        required: true
+        default: "true"
+      poke_branch:
+        description: "制造一个空提交并推送（触发 on:push 分支构建）"
+        type: choice
+        options: ["false", "true"]
+        required: true
+        default: "false"
+      dispatch_workflow:
+        description: "直接触发某个 workflow_dispatch 的工作流文件名（如 build.yml；留空则不触发）"
+        required: false
+        default: ""
+      dispatch_ref:
+        description: "workflow_dispatch 使用的 ref（默认用 work_branch）"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -68,7 +92,7 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      # —— SSH 准备（仅用于子模块） ——
+      # —— SSH 仅用于子模块 ——
       - name: Setup SSH agent with private key
         uses: webfactory/ssh-agent@v0.9.0
         with:
@@ -81,7 +105,7 @@ jobs:
           mkdir -p ~/.ssh
           ssh-keyscan -H github.com >> ~/.ssh/known_hosts
 
-      # —— 确保本地切到要操作的分支（从 origin/<branch> 检出/更新） ——
+      # —— 切到目标工作分支 —— 
       - name: Ensure local branch from origin
         run: |
           set -euo pipefail
@@ -100,7 +124,7 @@ jobs:
             fi
           fi
 
-      # —— 自动检测子模块分支（如用户填的分支不存在则使用远端默认分支）并写入配置 ——
+      # —— 自动检测子模块分支并写入配置 ——
       - name: Prepare submodule config (auto-detect branch if needed)
         id: sm_prep
         run: |
@@ -110,7 +134,6 @@ jobs:
           SM_SSH='${{ inputs.submodule_ssh_url }}'
           REQ_BRANCH='${{ inputs.submodule_branch }}'
 
-          # 检查请求的分支是否存在；若为 auto 或不存在，则取远端默认分支（HEAD）
           DETECTED_BRANCH="$REQ_BRANCH"
           if [ "$REQ_BRANCH" = "auto" ] || ! git ls-remote --heads "${SM_SSH}" "${REQ_BRANCH}" | grep -q .; then
             DETECTED_BRANCH="$(git ls-remote --symref "${SM_SSH}" HEAD | awk '/^ref:/ {print $2}' | sed 's#refs/heads/##')"
@@ -120,40 +143,32 @@ jobs:
             fi
             echo "使用检测到的远端默认分支：${DETECTED_BRANCH}"
           fi
-
           echo "sm_branch=${DETECTED_BRANCH}" >> "$GITHUB_OUTPUT"
 
-          # 写入 .gitmodules
           git config -f .gitmodules "submodule.${SM_NAME}.url"    "${SM_SSH}"
           git config -f .gitmodules "submodule.${SM_NAME}.path"   "${SM_PATH}"
           git config -f .gitmodules "submodule.${SM_NAME}.branch" "${DETECTED_BRANCH}"
-
           git add .gitmodules
           if ! git diff --cached --quiet; then
             git commit -m "使用 SSH 私有子模块 ${SM_SSH}，分支 ${DETECTED_BRANCH}"
           fi
-
-          # 同步到本地 submodule 配置（.git/config）
           git submodule set-url    "${SM_PATH}" "${SM_SSH}" || true
           git submodule set-branch --branch "${DETECTED_BRANCH}" "${SM_PATH}" || true
 
-      # —— 同步并更新子模块到远端分支最新提交（清理可能的半成品目录后重试） ——
+      # —— 更新子模块 —— 
       - name: Sync & update submodule (remote, resilient)
         run: |
           set -euo pipefail
           SM_PATH='${{ inputs.submodule_path }}'
           SM_BRANCH='${{ steps.sm_prep.outputs.sm_branch }}'
 
-          # 避免上次失败留下的半成品目录
           if [ -d "${SM_PATH}" ] && [ ! -d "${SM_PATH}/.git" ] && [ ! -f "${SM_PATH}/.git" ]; then
             rm -rf "${SM_PATH}"
           fi
 
           git submodule sync -- "${SM_PATH}"
-          # 初始化并拉取远端（跟踪已配置的 branch）
           git submodule update --init --remote "${SM_PATH}"
 
-          # 双保险：进入子模块显式抓取并切换到期望分支
           git -C "${SM_PATH}" fetch origin --no-tags
           if ! git -C "${SM_PATH}" rev-parse --verify -q "refs/remotes/origin/${SM_BRANCH}" >/dev/null; then
             echo "::error::子模块远端不存在分支 origin/${SM_BRANCH}。"
@@ -161,16 +176,22 @@ jobs:
           fi
           git -C "${SM_PATH}" checkout -B "${SM_BRANCH}" "origin/${SM_BRANCH}"
 
-          # 记录子模块的新提交（更新 superproject 的索引）
           git add "${SM_PATH}"
           if ! git diff --cached --quiet; then
             git commit -m "更新子模块 ${SM_PATH} 至远端分支 ${SM_BRANCH} 的最新提交"
           fi
 
-      # —— 用 PAT 推送分支（显式 refs/heads，避免与同名 tag 冲突） ——
+      # —— 可选：制造空提交，确保有 push 事件 —— 
+      - name: Poke branch with empty commit (optional)
+        if: ${{ inputs.poke_branch == 'true' }}
+        run: |
+          set -euo pipefail
+          git commit --allow-empty -m "ci: poke to trigger build $(date -u +%FT%TZ)"
+
+      # —— 用 PAT 推送分支（会触发 on:push） —— 
       - name: Push branch via PAT (triggers build)
         env:
-          GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}   # PAT，需至少 repo 权限
+          GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}   # PAT，需 repo 权限
         run: |
           set -euo pipefail
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
@@ -180,11 +201,11 @@ jobs:
             git push origin "HEAD:refs/heads/${WORK_BRANCH}"
           fi
 
-      # —— 可选：在当前分支 HEAD 打 Tag 并用 PAT 推送 ——
-      - name: Create/Push tag (optional, triggers build)
+      # —— 可选：在当前分支 HEAD 打 Tag —— 
+      - name: Create/Push tag (optional)
         if: ${{ inputs.do_tag == 'true' }}
         env:
-          GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}   # PAT，需至少 repo 权限
+          GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}   # PAT，需 repo 权限
         run: |
           set -euo pipefail
           TAG="${{ inputs.version }}"
@@ -195,15 +216,37 @@ jobs:
             git tag -a -f "$TAG" -m "$MSG"
           else
             if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-              echo "::error::Tag $TAG 已存在。若需覆盖，请将 force 设为 true"
-              exit 1
+              echo "::notice::Tag $TAG 已存在，保持不变（若需覆盖请 force=true）。"
+            else
+              git tag -a "$TAG" -m "$MSG"
             fi
-            git tag -a "$TAG" -m "$MSG"
           fi
 
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          # 若需要“重触发”，可删除远端同名 tag 再推送
+          if [ "${{ inputs.retag }}" = "true" ]; then
+            git push origin ":refs/tags/${TAG}" || true
+          fi
+
           if [ "$FORCE" = "true" ]; then
             git push --force-with-lease origin "refs/tags/${TAG}"
           else
             git push origin "refs/tags/${TAG}"
           fi
+
+      # —— 可选：直接调用目标构建工作流的 workflow_dispatch —— 
+      - name: Trigger build via workflow_dispatch (optional)
+        if: ${{ inputs.dispatch_workflow != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}   # PAT 需含 workflow 权限
+        run: |
+          set -euo pipefail
+          WF_FILE='${{ inputs.dispatch_workflow }}'
+          REF='${{ inputs.dispatch_ref }}'
+          if [ -z "$REF" ]; then REF="${WORK_BRANCH}"; fi
+
+          curl -sS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${WF_FILE}/dispatches" \
+            -d "{\"ref\":\"${REF}\",\"inputs\":{}}"

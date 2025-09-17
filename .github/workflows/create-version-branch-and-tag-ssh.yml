@@ -1,4 +1,4 @@
-name: 直接在分支修改：替换子模块(SSH)+打Tag（Retag触发构建）
+name: 直接在分支修改：公开子模块+URL替换+打Tag（Retag触发构建）
 
 on:
   workflow_dispatch:
@@ -14,17 +14,23 @@ on:
         required: true
         default: "false"
 
-      # 子模块参数（保持 ≤10 个 inputs）
-      submodule_ssh_url:
-        description: "子模块私有 fork（SSH）地址"
+      # 子模块（公开仓库，走 HTTPS）
+      submodule_url:
+        description: "子模块公开仓库（HTTPS）地址"
         required: true
-        default: "git@github.com:ldxw/rustdesk_hbb_common.git"
+        default: "https://github.com/ldxw/rustdesk_hbb_common.git"
       submodule_branch:
         description: "子模块分支（auto=自动检测远端默认分支）"
         required: true
         default: "auto"
 
-      # 打 tag 并触发构建（方案 A）
+      # URL 替换
+      admin_url:
+        description: "src/common.rs 中替换为的新管理端地址（替换 https://admin.rustdesk.com）"
+        required: true
+        default: "https://admin-hy.rs.ldxw.top"
+
+      # 打 tag 并触发构建（方案 A：retag）
       do_tag:
         description: "是否在当前分支 HEAD 打 Tag（版本号见下方）"
         type: choice
@@ -68,19 +74,6 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      # —— SSH 仅用于子模块 ——（pin 到 v0.8.0，避免清理阶段警告）
-      - name: Setup SSH agent with private key
-        uses: webfactory/ssh-agent@v0.8.0
-        with:
-          ssh-private-key: |
-            ${{ secrets.SSH_PRIVATE_KEY }}
-
-      - name: Trust github.com host key
-        run: |
-          set -euo pipefail
-          mkdir -p ~/.ssh
-          ssh-keyscan -H github.com >> ~/.ssh/known_hosts
-
       # —— 切到目标工作分支 —— 
       - name: Ensure local branch from origin
         run: |
@@ -107,12 +100,12 @@ jobs:
           set -euo pipefail
           SM_NAME='libs/hbb_common'
           SM_PATH='libs/hbb_common'
-          SM_SSH='${{ inputs.submodule_ssh_url }}'
+          SM_URL='${{ inputs.submodule_url }}'
           REQ_BRANCH='${{ inputs.submodule_branch }}'
 
           DETECTED_BRANCH="$REQ_BRANCH"
-          if [ "$REQ_BRANCH" = "auto" ] || ! git ls-remote --heads "${SM_SSH}" "${REQ_BRANCH}" | grep -q .; then
-            DETECTED_BRANCH="$(git ls-remote --symref "${SM_SSH}" HEAD | awk '/^ref:/ {print $2}' | sed 's#refs/heads/##')"
+          if [ "$REQ_BRANCH" = "auto" ] || ! git ls-remote --heads "${SM_URL}" "${REQ_BRANCH}" | grep -q .; then
+            DETECTED_BRANCH="$(git ls-remote --symref "${SM_URL}" HEAD | awk '/^ref:/ {print $2}' | sed 's#refs/heads/##')"
             if [ -z "${DETECTED_BRANCH}" ]; then
               echo "::error::无法检测子模块远端默认分支，请手动指定 submodule_branch。"
               exit 1
@@ -121,15 +114,17 @@ jobs:
           fi
           echo "sm_branch=${DETECTED_BRANCH}" >> "$GITHUB_OUTPUT"
 
-          git config -f .gitmodules "submodule.${SM_NAME}.url"    "${SM_SSH}"
+          # 写入 .gitmodules（公开仓库用 HTTPS）
+          git config -f .gitmodules "submodule.${SM_NAME}.url"    "${SM_URL}"
           git config -f .gitmodules "submodule.${SM_NAME}.path"   "${SM_PATH}"
           git config -f .gitmodules "submodule.${SM_NAME}.branch" "${DETECTED_BRANCH}"
           git add .gitmodules
           if ! git diff --cached --quiet; then
-            git commit -m "使用 SSH 私有子模块 ${SM_SSH}，分支 ${DETECTED_BRANCH}"
+            git commit -m "使用公开子模块 ${SM_URL}，分支 ${DETECTED_BRANCH}"
           fi
 
-          git submodule set-url    "${SM_PATH}" "${SM_SSH}" || true
+          # 同步到本地 submodule 配置（.git/config）
+          git submodule set-url    "${SM_PATH}" "${SM_URL}" || true
           git submodule set-branch --branch "${DETECTED_BRANCH}" "${SM_PATH}" || true
 
       # —— 更新子模块 —— 
@@ -139,6 +134,7 @@ jobs:
           SM_PATH='libs/hbb_common'
           SM_BRANCH='${{ steps.sm_prep.outputs.sm_branch }}'
 
+          # 避免上次失败留下的半成品目录
           if [ -d "${SM_PATH}" ] && [ ! -d "${SM_PATH}/.git" ] && [ ! -f "${SM_PATH}/.git" ]; then
             rm -rf "${SM_PATH}"
           fi
@@ -146,6 +142,7 @@ jobs:
           git submodule sync -- "${SM_PATH}"
           git submodule update --init --remote "${SM_PATH}"
 
+          # 双保险：进入子模块显式抓取并切换到期望分支
           git -C "${SM_PATH}" fetch origin --no-tags
           if ! git -C "${SM_PATH}" rev-parse --verify -q "refs/remotes/origin/${SM_BRANCH}" >/dev/null; then
             echo "::error::子模块远端不存在分支 origin/${SM_BRANCH}。"
@@ -153,9 +150,34 @@ jobs:
           fi
           git -C "${SM_PATH}" checkout -B "${SM_BRANCH}" "origin/${SM_BRANCH}"
 
+          # 记录子模块的新提交（更新 superproject 的索引）
           git add "${SM_PATH}"
           if ! git diff --cached --quiet; then
             git commit -m "更新子模块 ${SM_PATH} 至远端分支 ${SM_BRANCH} 的最新提交"
+          fi
+
+      # —— URL 替换：src/common.rs 中将 admin.rustdesk.com 替换为自定义地址 —— 
+      - name: Replace admin URL in src/common.rs
+        run: |
+          set -euo pipefail
+          FILE="src/common.rs"
+          NEW_URL='${{ inputs.admin_url }}'
+
+          if [ ! -f "$FILE" ]; then
+            echo "::warning file=${FILE}::未找到 ${FILE}，跳过 URL 替换"
+          else
+            BEFORE_SHA=$(sha256sum "$FILE" | awk '{print $1}')
+            NEW_ESC=${NEW_URL//&/\\&}
+            sed -i -e "s|https://admin\.rustdesk\.com|$NEW_ESC|g" "$FILE"
+            AFTER_SHA=$(sha256sum "$FILE" | awk '{print $1}')
+
+            if [ "$BEFORE_SHA" != "$AFTER_SHA" ]; then
+              git add "$FILE"
+              git commit -m "chore: replace admin URL in src/common.rs -> ${NEW_URL}"
+              echo "URL 替换完成：https://admin.rustdesk.com -> ${NEW_URL}"
+            else
+              echo "未发现可替换的目标 URL，或内容已是最新。"
+            fi
           fi
 
       # —— 用 PAT 推送分支（正常 push 事件） —— 
@@ -199,7 +221,6 @@ jobs:
           if [ "${{ inputs.trigger_mode }}" = "retag" ]; then
             git push origin ":refs/tags/${TAG}" || true
           elif [ "${{ inputs.trigger_mode }}" = "poke" ]; then
-            # 若选了 poke，这里不删 tag，由上一步的分支空提交触发
             :
           fi
 

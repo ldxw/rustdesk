@@ -1,0 +1,248 @@
+name: 上游同步 + 私有子模块(SSH) + 打Tag（独立运行）
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_type:
+        description: "来源类型：tag 或 branch"
+        type: choice
+        options: ["tag", "branch"]
+        default: "tag"
+        required: true
+      version:
+        description: "版本号（用于创建同名 tag，如 1.4.2）"
+        default: "1.4.2"
+        required: true
+      upstream_repo:
+        description: "上游仓库（owner/repo）"
+        default: "rustdesk/rustdesk"
+        required: true
+      source_branch:
+        description: "当 source_type=branch 时要拉取的上游分支名"
+        default: "master"
+        required: false
+      force:
+        description: "是否强制覆盖分支/重打 tag"
+        type: choice
+        options: ["false", "true"]
+        default: "false"
+        required: true
+      submodule_name:
+        description: "子模块名（.gitmodules 中括号名）"
+        default: "libs/hbb_common"
+        required: true
+      submodule_path:
+        description: "子模块路径（.gitmodules 的 path）"
+        default: "libs/hbb_common"
+        required: true
+      submodule_ssh_url:
+        description: "你的私有 fork（SSH）地址"
+        default: "git@github.com:ldxw/rustdesk_hbb_common.git"
+        required: true
+      submodule_branch:
+        description: "子模块要跟踪的分支（用于 --remote）"
+        default: "master"
+        required: true
+      tag_message:
+        description: "Tag 注释信息"
+        default: "修改内置服务器和 key"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      FORCE: ${{ inputs.force }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Checkout this repo (no submodules)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Stash workflow files (protect from overwrite)
+        id: stash_wf
+        run: |
+          set -euo pipefail
+          if ls .github/workflows/*.yml >/dev/null 2>&1; then
+            git stash push -u -- .github/workflows/*.yml
+            echo "stashed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "stashed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure git identity
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global --unset-all http.https://github.com/.extraheader || true
+
+      # —— SSH 准备（用 Secrets 里的私钥） ————————————————————————————————
+      - name: Setup SSH agent with private key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: |
+            ${{ secrets.SSH_PRIVATE_KEY }}
+            # 如需加载第二把私钥（分别访问不同仓库），可在仓库 Secrets 新增 SSH_PRIVATE_KEY_2，
+            # 并在此追加：${{ secrets.SSH_PRIVATE_KEY_2 }}
+
+      - name: Trust github.com host key
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+
+      # —— 读取上游（用 HTTPS 匿名拉取即可） ————————————————————————————————
+      - name: Add upstream & fetch required refs
+        id: upstream
+        run: |
+          set -euo pipefail
+          UPSTREAM="${{ inputs.upstream_repo }}"
+          TYPE="${{ inputs.source_type }}"
+          BR="${{ inputs.source_branch }}"
+          VER="${{ inputs.version }}"
+
+          git remote add upstream "https://github.com/${UPSTREAM}.git" || true
+
+          if [ "$TYPE" = "tag" ]; then
+            git fetch --no-tags upstream tag "$VER"
+            echo "is_tag=true" >> "$GITHUB_OUTPUT"
+            echo "target_branch=$VER" >> "$GITHUB_OUTPUT"
+          else
+            git fetch --no-tags upstream "$BR"
+            echo "is_tag=false" >> "$GITHUB_OUTPUT"
+            echo "target_branch=$BR" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check if target branch exists locally
+        id: branch_check
+        run: |
+          set -euo pipefail
+          TARGET_BRANCH="${{ steps.upstream.outputs.target_branch }}"
+          if git show-ref --verify --quiet "refs/heads/${TARGET_BRANCH}"; then
+            echo "branch_exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "branch_exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create/Reset branch from upstream
+        if: ${{ steps.branch_check.outputs.branch_exists == 'false' || inputs.force == 'true' }}
+        run: |
+          set -euo pipefail
+          TARGET_BRANCH="${{ steps.upstream.outputs.target_branch }}"
+          IS_TAG="${{ steps.upstream.outputs.is_tag }}"
+          VER="${{ inputs.version }}"
+          BR="${{ inputs.source_branch }}"
+
+          if [ "$IS_TAG" = "true" ]; then
+            git checkout -B "$TARGET_BRANCH" "refs/tags/$VER"
+            git commit --allow-empty -m "Init $TARGET_BRANCH from upstream tag $VER" || true
+          else
+            git checkout -B "$TARGET_BRANCH" "upstream/$BR"
+            git commit --allow-empty -m "Init $TARGET_BRANCH from upstream branch $BR" || true
+          fi
+
+      - name: Incremental merge from upstream
+        if: ${{ steps.branch_check.outputs.branch_exists == 'true' && inputs.force == 'false' }}
+        run: |
+          set -euo pipefail
+          TARGET_BRANCH="${{ steps.upstream.outputs.target_branch }}"
+          IS_TAG="${{ steps.upstream.outputs.is_tag }}"
+          VER="${{ inputs.version }}"
+          BR="${{ inputs.source_branch }}"
+
+          git checkout "$TARGET_BRANCH"
+
+          if [ "$IS_TAG" = "true" ]; then
+            git fetch --no-tags upstream tag "$VER" || true
+            git merge --no-ff -X theirs "refs/tags/$VER" \
+              -m "Merge upstream tag $VER into $TARGET_BRANCH (prefer upstream)"
+          else
+            git fetch --no-tags upstream "$BR" || true
+            git merge --no-ff -X theirs "upstream/$BR" \
+              -m "Merge upstream $BR into $TARGET_BRANCH (prefer upstream)"
+          fi
+
+      - name: Restore workflow files if stashed
+        if: ${{ steps.stash_wf.outputs.stashed == 'true' }}
+        run: |
+          set -euo pipefail
+          git stash pop --quiet || true
+          if ! git diff --quiet -- .github/workflows; then
+            git add .github/workflows
+            git commit -m "Preserve workflow files"
+          fi
+
+      # —— 改 .gitmodules 为 SSH 私有 fork ————————————————————————————————
+      - name: Rewrite .gitmodules to SSH URL & branch
+        run: |
+          set -euo pipefail
+          SM_NAME='${{ inputs.submodule_name }}'
+          SM_PATH='${{ inputs.submodule_path }}'
+          SM_SSH='${{ inputs.submodule_ssh_url }}'
+          SM_BRANCH='${{ inputs.submodule_branch }}'
+
+          git config -f .gitmodules "submodule.${SM_NAME}.url"    "${SM_SSH}"
+          git config -f .gitmodules "submodule.${SM_NAME}.path"   "${SM_PATH}"
+          git config -f .gitmodules "submodule.${SM_NAME}.branch" "${SM_BRANCH}"
+
+          git add .gitmodules
+          if ! git diff --cached --quiet; then
+            git commit -m "使用 SSH 私有子模块 ${SM_SSH}，分支 ${SM_BRANCH}"
+          fi
+
+      - name: Sync & update submodule to latest remote commit (SSH)
+        run: |
+          set -euo pipefail
+          SM_PATH='${{ inputs.submodule_path }}'
+          git submodule sync -- "${SM_PATH}"
+          git submodule update --init --remote "${SM_PATH}"
+
+          git add "${SM_PATH}"
+          if ! git diff --cached --quiet; then
+            git commit -m "更新子模块 ${SM_PATH} 至远端分支最新提交"
+          fi
+
+      # —— 用 SSH 推送分支与 Tag ————————————————————————————————
+      - name: Set origin to SSH and push branch (explicit refs/heads)
+        run: |
+          set -euo pipefail
+          TARGET_BRANCH="${{ steps.upstream.outputs.target_branch }}"
+          git checkout "$TARGET_BRANCH"
+
+          # 用 SSH 地址推送到当前仓库
+          git remote set-url origin "git@github.com:${GITHUB_REPOSITORY}.git"
+
+          if [ "$FORCE" = "true" ]; then
+            git push --force-with-lease origin "HEAD:refs/heads/${TARGET_BRANCH}"
+          else
+            git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
+          fi
+
+      - name: Create/Update tag = version, then push over SSH
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.version }}"
+          MSG="${{ inputs.tag_message }}"
+
+          if [ "$FORCE" = "true" ]; then
+            git tag -a -f "$TAG" -m "$MSG"
+          else
+            if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+              echo "::error::Tag $TAG 已存在。若需覆盖，请将 force 设为 true"
+              exit 1
+            fi
+            git tag -a "$TAG" -m "$MSG"
+          fi
+
+          # 推送 tag（显式 refs/tags，避免与分支混淆）
+          if [ "$FORCE" = "true" ]; then
+            git push --force-with-lease origin "refs/tags/${TAG}"
+          else
+            git push origin "refs/tags/${TAG}"
+          fi

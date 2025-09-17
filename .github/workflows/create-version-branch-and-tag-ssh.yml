@@ -1,10 +1,10 @@
-name: 直接在分支修改：替换子模块(SSH)并推送/可选打Tag
+name: 直接在分支修改：替换子模块(SSH)并推送/可选打Tag（自动检测分支）
 
 on:
   workflow_dispatch:
     inputs:
       work_branch:
-        description: "要修改并推送的分支（已存在于远端 origin）"
+        description: "要修改并推送的分支（已存在远端 origin）"
         required: true
         default: "1.4.2"
       force:
@@ -27,9 +27,9 @@ on:
         required: true
         default: "git@github.com:ldxw/rustdesk_hbb_common.git"
       submodule_branch:
-        description: "子模块需要跟踪的分支（用于 --remote）"
+        description: "子模块需要跟踪的分支（填 auto 则自动检测远端默认分支）"
         required: true
-        default: "master"
+        default: "auto"
       # 可选打 tag
       do_tag:
         description: "是否在当前分支 HEAD 打同名/指定版本 Tag"
@@ -87,7 +87,6 @@ jobs:
           git fetch origin --no-tags
           if git show-ref --verify --quiet "refs/heads/${WORK_BRANCH}"; then
             git checkout "${WORK_BRANCH}"
-            # 以远端为准快进
             if git show-ref --verify --quiet "refs/remotes/origin/${WORK_BRANCH}"; then
               git merge --ff-only "origin/${WORK_BRANCH}" || true
             fi
@@ -100,35 +99,71 @@ jobs:
             fi
           fi
 
-      # —— 修改 .gitmodules 为私有 SSH 地址 + 指定分支 ——
-      - name: Rewrite .gitmodules to SSH & branch
+      # —— 自动检测子模块分支（如用户填的分支不存在则使用远端默认分支）并写入配置 ——
+      - name: Prepare submodule config (auto-detect branch if needed)
+        id: sm_prep
         run: |
           set -euo pipefail
           SM_NAME='${{ inputs.submodule_name }}'
           SM_PATH='${{ inputs.submodule_path }}'
           SM_SSH='${{ inputs.submodule_ssh_url }}'
-          SM_BRANCH='${{ inputs.submodule_branch }}'
+          REQ_BRANCH='${{ inputs.submodule_branch }}'
 
+          # 检查请求的分支是否存在；若为 auto 或不存在，则取远端默认分支（HEAD）
+          DETECTED_BRANCH="$REQ_BRANCH"
+          if [ "$REQ_BRANCH" = "auto" ] || ! git ls-remote --heads "${SM_SSH}" "${REQ_BRANCH}" | grep -q .; then
+            DETECTED_BRANCH="$(git ls-remote --symref "${SM_SSH}" HEAD | awk '/^ref:/ {print $2}' | sed 's#refs/heads/##')"
+            if [ -z "${DETECTED_BRANCH}" ]; then
+              echo "::error::无法检测子模块远端默认分支，请手动指定 submodule_branch。"
+              exit 1
+            fi
+            echo "提示：使用检测到的远端默认分支 ${DETECTED_BRANCH}"
+          fi
+
+          echo "sm_branch=${DETECTED_BRANCH}" >> "$GITHUB_OUTPUT"
+
+          # 写入 .gitmodules
           git config -f .gitmodules "submodule.${SM_NAME}.url"    "${SM_SSH}"
           git config -f .gitmodules "submodule.${SM_NAME}.path"   "${SM_PATH}"
-          git config -f .gitmodules "submodule.${SM_NAME}.branch" "${SM_BRANCH}"
+          git config -f .gitmodules "submodule.${SM_NAME}.branch" "${DETECTED_BRANCH}"
 
           git add .gitmodules
           if ! git diff --cached --quiet; then
-            git commit -m "使用 SSH 私有子模块 ${SM_SSH}，分支 ${SM_BRANCH}"
+            git commit -m "使用 SSH 私有子模块 ${SM_SSH}，分支 ${DETECTED_BRANCH}"
           fi
 
-      # —— 同步并更新子模块到远端分支最新提交 ——
-      - name: Sync & update submodule (remote)
+          # 同步到本地 submodule 配置（.git/config）
+          git submodule set-url    "${SM_PATH}" "${SM_SSH}" || true
+          git submodule set-branch --branch "${DETECTED_BRANCH}" "${SM_PATH}" || true
+
+      # —— 同步并更新子模块到远端分支最新提交（清理可能的半成品目录后重试） ——
+      - name: Sync & update submodule (remote, resilient)
         run: |
           set -euo pipefail
           SM_PATH='${{ inputs.submodule_path }}'
+          SM_BRANCH='${{ steps.sm_prep.outputs.sm_branch }}'
+
+          # 避免上次失败留下的半成品目录
+          if [ -d "${SM_PATH}" ] && [ ! -d "${SM_PATH}/.git" ] && [ ! -f "${SM_PATH}/.git" ]; then
+            rm -rf "${SM_PATH}"
+          fi
+
           git submodule sync -- "${SM_PATH}"
+          # 初始化并拉取远端（跟踪已配置的 branch）
           git submodule update --init --remote "${SM_PATH}"
 
+          # 双保险：进入子模块显式抓取并切换到期望分支
+          git -C "${SM_PATH}" fetch origin --no-tags
+          if ! git -C "${SM_PATH}" rev-parse --verify -q "refs/remotes/origin/${SM_BRANCH}" >/dev/null; then
+            echo "::error::子模块远端不存在分支 origin/${SM_BRANCH}。"
+            exit 1
+          fi
+          git -C "${SM_PATH}" checkout -B "${SM_BRANCH}" "origin/${SM_BRANCH}"
+
+          # 记录子模块的新提交（更新 superproject 的索引）
           git add "${SM_PATH}"
           if ! git diff --cached --quiet; then
-            git commit -m "更新子模块 ${SM_PATH} 至远端分支最新提交"
+            git commit -m "更新子模块 ${SM_PATH} 至远端分支 ${SM_BRANCH} 的最新提交"
           fi
 
       # —— 用 SSH 推送分支（显式 refs/heads，避免与同名 tag 冲突） ——

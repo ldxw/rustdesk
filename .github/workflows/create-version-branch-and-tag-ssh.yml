@@ -1,4 +1,4 @@
-name: 直接在分支修改：替换子模块(SSH)并推送/可选打Tag（可触发构建）
+name: 直接在分支修改：替换子模块(SSH)并推送/可选打Tag（≤10 inputs）
 
 on:
   workflow_dispatch:
@@ -13,28 +13,16 @@ on:
         options: ["false", "true"]
         required: true
         default: "false"
-
-      # 子模块参数
-      submodule_name:
-        description: ".gitmodules 中的子模块名（方括号里的名称）"
-        required: true
-        default: "libs/hbb_common"
-      submodule_path:
-        description: "子模块路径（.gitmodules 的 path）"
-        required: true
-        default: "libs/hbb_common"
       submodule_ssh_url:
-        description: "私有 fork 的 SSH 地址"
+        description: "子模块私有 fork（SSH）地址"
         required: true
         default: "git@github.com:ldxw/rustdesk_hbb_common.git"
       submodule_branch:
-        description: "子模块需要跟踪的分支（填 auto 则自动检测远端默认分支）"
+        description: "子模块分支（auto=自动检测远端默认分支）"
         required: true
         default: "auto"
-
-      # 可选打 tag
       do_tag:
-        description: "是否在当前分支 HEAD 打同名/指定版本 Tag"
+        description: "是否在当前分支 HEAD 打 Tag（版本号见下方）"
         type: choice
         options: ["false", "true"]
         required: true
@@ -47,28 +35,12 @@ on:
         description: "Tag 注释信息"
         required: false
         default: "修改内置服务器和 key"
-
-      # —— 构建触发选项（3 选 1，用哪个就设为 true） ——
-      retag:
-        description: "删除远端同名 tag 后重推（触发 on:push:tags）"
+      trigger_mode:
+        description: "如何触发构建：none=仅正常推送；poke=空提交触发 push；retag=删除同名 tag 后重推"
         type: choice
-        options: ["false", "true"]
+        options: ["none", "poke", "retag"]
         required: true
-        default: "true"
-      poke_branch:
-        description: "制造一个空提交并推送（触发 on:push 分支构建）"
-        type: choice
-        options: ["false", "true"]
-        required: true
-        default: "false"
-      dispatch_workflow:
-        description: "直接触发某个 workflow_dispatch 的工作流文件名（如 build.yml；留空则不触发）"
-        required: false
-        default: ""
-      dispatch_ref:
-        description: "workflow_dispatch 使用的 ref（默认用 work_branch）"
-        required: false
-        default: ""
+        default: "retag"   # 常用于 on:push:tags 的构建
 
 permissions:
   contents: write
@@ -124,13 +96,13 @@ jobs:
             fi
           fi
 
-      # —— 自动检测子模块分支并写入配置 ——
+      # —— 配置并（必要时自动检测）子模块分支 —— 
       - name: Prepare submodule config (auto-detect branch if needed)
         id: sm_prep
         run: |
           set -euo pipefail
-          SM_NAME='${{ inputs.submodule_name }}'
-          SM_PATH='${{ inputs.submodule_path }}'
+          SM_NAME='libs/hbb_common'
+          SM_PATH='libs/hbb_common'
           SM_SSH='${{ inputs.submodule_ssh_url }}'
           REQ_BRANCH='${{ inputs.submodule_branch }}'
 
@@ -152,6 +124,7 @@ jobs:
           if ! git diff --cached --quiet; then
             git commit -m "使用 SSH 私有子模块 ${SM_SSH}，分支 ${DETECTED_BRANCH}"
           fi
+
           git submodule set-url    "${SM_PATH}" "${SM_SSH}" || true
           git submodule set-branch --branch "${DETECTED_BRANCH}" "${SM_PATH}" || true
 
@@ -159,7 +132,7 @@ jobs:
       - name: Sync & update submodule (remote, resilient)
         run: |
           set -euo pipefail
-          SM_PATH='${{ inputs.submodule_path }}'
+          SM_PATH='libs/hbb_common'
           SM_BRANCH='${{ steps.sm_prep.outputs.sm_branch }}'
 
           if [ -d "${SM_PATH}" ] && [ ! -d "${SM_PATH}/.git" ] && [ ! -f "${SM_PATH}/.git" ]; then
@@ -181,9 +154,9 @@ jobs:
             git commit -m "更新子模块 ${SM_PATH} 至远端分支 ${SM_BRANCH} 的最新提交"
           fi
 
-      # —— 可选：制造空提交，确保有 push 事件 —— 
+      # —— 可选：制造空提交触发 on:push —— 
       - name: Poke branch with empty commit (optional)
-        if: ${{ inputs.poke_branch == 'true' }}
+        if: ${{ inputs.trigger_mode == 'poke' }}
         run: |
           set -euo pipefail
           git commit --allow-empty -m "ci: poke to trigger build $(date -u +%FT%TZ)"
@@ -191,7 +164,7 @@ jobs:
       # —— 用 PAT 推送分支（会触发 on:push） —— 
       - name: Push branch via PAT (triggers build)
         env:
-          GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}   # PAT，需 repo 权限
+          GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}   # PAT，需 repo 权限（若用 dispatch 还需 workflow 权限）
         run: |
           set -euo pipefail
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
@@ -201,11 +174,11 @@ jobs:
             git push origin "HEAD:refs/heads/${WORK_BRANCH}"
           fi
 
-      # —— 可选：在当前分支 HEAD 打 Tag —— 
+      # —— 可选：在当前分支 HEAD 打 Tag 并用 PAT 推送 —— 
       - name: Create/Push tag (optional)
         if: ${{ inputs.do_tag == 'true' }}
         env:
-          GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}   # PAT，需 repo 权限
+          GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}
         run: |
           set -euo pipefail
           TAG="${{ inputs.version }}"
@@ -223,8 +196,9 @@ jobs:
           fi
 
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          # 若需要“重触发”，可删除远端同名 tag 再推送
-          if [ "${{ inputs.retag }}" = "true" ]; then
+
+          # 触发 on:push:tags：选择 retag 模式则先删除远端同名 tag 再推送
+          if [ "${{ inputs.trigger_mode }}" = "retag" ]; then
             git push origin ":refs/tags/${TAG}" || true
           fi
 
@@ -233,20 +207,3 @@ jobs:
           else
             git push origin "refs/tags/${TAG}"
           fi
-
-      # —— 可选：直接调用目标构建工作流的 workflow_dispatch —— 
-      - name: Trigger build via workflow_dispatch (optional)
-        if: ${{ inputs.dispatch_workflow != '' }}
-        env:
-          GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}   # PAT 需含 workflow 权限
-        run: |
-          set -euo pipefail
-          WF_FILE='${{ inputs.dispatch_workflow }}'
-          REF='${{ inputs.dispatch_ref }}'
-          if [ -z "$REF" ]; then REF="${WORK_BRANCH}"; fi
-
-          curl -sS -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${WF_FILE}/dispatches" \
-            -d "{\"ref\":\"${REF}\",\"inputs\":{}}"

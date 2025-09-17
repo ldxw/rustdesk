@@ -16,10 +16,13 @@ on:
         required: false
         default: "1.4.2"
       force:
-        description: "强制覆盖同名远端分支（全量替换而非增量合并）"
+        description: "是否强制覆盖同名远端分支（全量替换而非增量合并）"
         required: true
-        type: boolean
-        default: false
+        type: choice           # 兼容所有 Runner：用字符串选项代替 boolean
+        options:
+          - "false"
+          - "true"
+        default: "false"
       upstream_repo:
         description: "上游仓库（owner/repo）"
         required: true
@@ -43,9 +46,9 @@ jobs:
       - id: check
         run: |
           set -euo pipefail
-          SOURCE_TYPE="${{ github.event.inputs.source_type }}"
-          VERSION="${{ github.event.inputs.version }}"
-          TARGET_DIR="${{ github.event.inputs.target_directory }}"
+          SOURCE_TYPE="${{ inputs.source_type }}"
+          VERSION="${{ inputs.version }}"
+          TARGET_DIR="${{ inputs.target_directory }}"
           
           if [ "$SOURCE_TYPE" = "tag" ] && [ -z "${VERSION}" ]; then
             echo "::error::当源类型为tag时，版本号不能为空"
@@ -104,7 +107,7 @@ jobs:
       - name: Add upstream repository
         run: |
           set -euo pipefail
-          UPSTREAM="${{ github.event.inputs.upstream_repo }}"
+          UPSTREAM="${{ inputs.upstream_repo }}"
           git remote add upstream "https://github.com/${UPSTREAM}.git" || true
           # 仅抓分支引用，不抓取任何 tag，避免 clobber
           git fetch upstream --no-tags
@@ -113,8 +116,8 @@ jobs:
         id: source_info
         run: |
           set -euo pipefail
-          SOURCE_TYPE="${{ github.event.inputs.source_type }}"
-          VERSION="${{ github.event.inputs.version }}"
+          SOURCE_TYPE="${{ inputs.source_type }}"
+          VERSION="${{ inputs.version }}"
           TARGET_BRANCH="${{ needs.validate_inputs.outputs.target_branch }}"
           
           if [ "$SOURCE_TYPE" = "tag" ]; then
@@ -140,7 +143,7 @@ jobs:
           fi
 
       - name: Initialize new branch from upstream source (首次拉取/强制覆盖)
-        if: ${{ steps.branch_check.outputs.branch_exists == 'false' || github.event.inputs.force == 'true' }}
+        if: ${{ steps.branch_check.outputs.branch_exists == 'false' || inputs.force == 'true' }}
         run: |
           set -euo pipefail
           TARGET_BRANCH="${{ steps.source_info.outputs.target_branch }}"
@@ -166,7 +169,7 @@ jobs:
           fi
 
       - name: Incremental merge upstream changes (增量拉取)
-        if: ${{ steps.branch_check.outputs.branch_exists == 'true' && github.event.inputs.force == 'false' }}
+        if: ${{ steps.branch_check.outputs.branch_exists == 'true' && inputs.force == 'false' }}
         run: |
           set -euo pipefail
           TARGET_BRANCH="${{ steps.source_info.outputs.target_branch }}"
@@ -209,16 +212,21 @@ jobs:
         run: |
           set -euo pipefail
           TARGET_BRANCH="${{ steps.source_info.outputs.target_branch }}"
-          FORCE="${{ github.event.inputs.force }}"
-          
+          FORCE="${{ inputs.force }}"
+
+          # 确保当前就位于目标分支（避免 HEAD 指向其他分支时推送出错）
+          git checkout "$TARGET_BRANCH"
+
+          # 如配置了 PAT，用它作为 origin
           if [ -n "${PAT:-}" ]; then
             git remote set-url origin "https://${PAT}@github.com/${GITHUB_REPOSITORY}.git"
           fi
-          
+
+          # 明确推送到 refs/heads，避免与同名 tag 冲突
           if [ "$FORCE" = "true" ]; then
-            git push --force-with-lease origin "$TARGET_BRANCH"
+            git push --force-with-lease origin "HEAD:refs/heads/${TARGET_BRANCH}"
           else
-            git push origin "$TARGET_BRANCH"
+            git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
           fi
 
       - name: Checkout to target directory

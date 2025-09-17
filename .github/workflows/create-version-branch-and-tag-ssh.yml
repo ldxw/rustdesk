@@ -1,4 +1,4 @@
-name: 直接在分支修改：替换子模块(SSH)并推送/可选打Tag（自动检测分支）
+name: 直接在分支修改：替换子模块(SSH)并推送/可选打Tag（Token推送）
 
 on:
   workflow_dispatch:
@@ -68,12 +68,13 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      # —— SSH 准备 ——
+      # —— SSH 准备（仅用于子模块） ——
       - name: Setup SSH agent with private key
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: |
             ${{ secrets.SSH_PRIVATE_KEY }}
+
       - name: Trust github.com host key
         run: |
           set -euo pipefail
@@ -117,7 +118,7 @@ jobs:
               echo "::error::无法检测子模块远端默认分支，请手动指定 submodule_branch。"
               exit 1
             fi
-            echo "提示：使用检测到的远端默认分支 ${DETECTED_BRANCH}"
+            echo "使用检测到的远端默认分支：${DETECTED_BRANCH}"
           fi
 
           echo "sm_branch=${DETECTED_BRANCH}" >> "$GITHUB_OUTPUT"
@@ -166,20 +167,24 @@ jobs:
             git commit -m "更新子模块 ${SM_PATH} 至远端分支 ${SM_BRANCH} 的最新提交"
           fi
 
-      # —— 用 SSH 推送分支（显式 refs/heads，避免与同名 tag 冲突） ——
-      - name: Push branch via SSH
+      # —— 用 Token 推送分支（显式 refs/heads，避免与同名 tag 冲突） ——
+      - name: Push branch via token (recommended)
+        env:
+          GH_TOKEN: ${{ github.token }}   # 或改为: secrets.REPO_WORKFLOW_PAT
         run: |
           set -euo pipefail
-          git remote set-url origin "git@github.com:${GITHUB_REPOSITORY}.git"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           if [ "$FORCE" = "true" ]; then
             git push --force-with-lease origin "HEAD:refs/heads/${WORK_BRANCH}"
           else
             git push origin "HEAD:refs/heads/${WORK_BRANCH}"
           fi
 
-      # —— 可选：在当前分支 HEAD 打 Tag 并推送 ——
+      # —— 可选：在当前分支 HEAD 打 Tag 并用 Token 推送 ——
       - name: Create/Push tag (optional)
         if: ${{ inputs.do_tag == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}   # 或改为: secrets.REPO_WORKFLOW_PAT
         run: |
           set -euo pipefail
           TAG="${{ inputs.version }}"
@@ -196,7 +201,7 @@ jobs:
             git tag -a "$TAG" -m "$MSG"
           fi
 
-          git remote set-url origin "git@github.com:${GITHUB_REPOSITORY}.git"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           if [ "$FORCE" = "true" ]; then
             git push --force-with-lease origin "refs/tags/${TAG}"
           else

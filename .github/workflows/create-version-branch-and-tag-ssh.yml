@@ -1,10 +1,10 @@
-name: 直接在分支修改：公开子模块+URL替换+打Tag（Retag触发构建）
+name: 直接在分支修改：公开子模块+URL替换+打Tag（tag锚定分支提交）
 
 on:
   workflow_dispatch:
     inputs:
       work_branch:
-        description: "要修改并推送的分支（已存在远端 origin）"
+        description: "要修改并推送的分支（例如 1.4.2）"
         required: true
         default: "1.4.2"
       force:
@@ -30,9 +30,9 @@ on:
         required: true
         default: "https://admin-hy.rs.ldxw.top"
 
-      # 打 tag 并触发构建（方案 A：retag）
+      # 打 tag 并触发构建（retag=删除远端同名 tag 后重推）
       do_tag:
-        description: "是否在当前分支 HEAD 打 Tag（版本号见下方）"
+        description: "是否在 work_branch 的 HEAD 打 Tag（版本号见下方）"
         type: choice
         options: ["false", "true"]
         required: true
@@ -180,6 +180,13 @@ jobs:
             fi
           fi
 
+      # —— 可选：制造空提交触发 on:push（如果你选择 poke） —— 
+      - name: Poke branch with empty commit (optional)
+        if: ${{ inputs.trigger_mode == 'poke' }}
+        run: |
+          set -euo pipefail
+          git commit --allow-empty -m "ci: poke to trigger build $(date -u +%FT%TZ)"
+
       # —— 用 PAT 推送分支（正常 push 事件） —— 
       - name: Push branch via PAT
         env:
@@ -193,38 +200,41 @@ jobs:
             git push origin "HEAD:refs/heads/${WORK_BRANCH}"
           fi
 
-      # —— 方案 A：删除远端同名 tag 后重推，强制触发 on:push:tags —— 
-      - name: Create/Retag & Push tag (RETAG trigger)
+      # —— 在 work_branch 的 HEAD 打 tag（tag 锚定到分支提交），并按需 retag 触发构建 —— 
+      - name: Create/Retag & Push tag (tag anchored to branch HEAD)
         if: ${{ inputs.do_tag == 'true' }}
         env:
-          GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}   # PAT：需 repo 权限（如需调用别的 workflow 还要 workflow 权限）
+          GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}   # PAT：需 repo 权限
         run: |
           set -euo pipefail
-          TAG="${{ inputs.version }}"
-          if [ -z "${TAG}" ]; then TAG="${WORK_BRANCH}"; fi
+          TAG_INPUT='${{ inputs.version }}'
+          TAG="$TAG_INPUT"
+          if [ -z "$TAG" ]; then TAG="${WORK_BRANCH}"; fi
           MSG='${{ inputs.tag_message }}'
 
-          # 本地创建/更新注释 tag
+          # 取出 work_branch 的提交 SHA，确保 tag 锚定到该分支的 HEAD
+          git checkout "${WORK_BRANCH}"
+          COMMIT_SHA="$(git rev-parse "${WORK_BRANCH}^{commit}")"
+
+          # 如选择 retag，先删除远端同名 tag 以强制触发 on:push:tags
+          if [ "${{ inputs.trigger_mode }}" = "retag" ]; then
+            git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+            git push origin ":refs/tags/${TAG}" || true
+          fi
+
+          # 在指定提交上创建/更新注释 tag（显式绑定 COMMIT_SHA）
           if [ "$FORCE" = "true" ]; then
-            git tag -a -f "$TAG" -m "$MSG"
+            git tag -a -f "$TAG" -m "$MSG" "$COMMIT_SHA"
           else
             if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-              echo "::notice::本地已存在 tag $TAG，将直接使用该引用。"
+              echo "::notice::Tag $TAG 已存在，将保持不变（若需覆盖请 force=true 或 trigger_mode=retag）。"
             else
-              git tag -a "$TAG" -m "$MSG"
+              git tag -a "$TAG" -m "$MSG" "$COMMIT_SHA"
             fi
           fi
 
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-
-          # 方案A触发关键：先删远端同名 tag（若存在），再推送新的
-          if [ "${{ inputs.trigger_mode }}" = "retag" ]; then
-            git push origin ":refs/tags/${TAG}" || true
-          elif [ "${{ inputs.trigger_mode }}" = "poke" ]; then
-            :
-          fi
-
-          if [ "$FORCE" = "true" ]; then
+          if [ "$FORCE" = "true" ] || [ "${{ inputs.trigger_mode }}" = "retag" ]; then
             git push --force-with-lease origin "refs/tags/${TAG}"
           else
             git push origin "refs/tags/${TAG}"

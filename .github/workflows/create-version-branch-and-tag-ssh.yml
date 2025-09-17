@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       work_branch:
-        description: "要修改并推送的分支（例如 1.4.2）"
+        description: "要修改并推送的分支（变量，可填任意存在的分支名，例如 1.4.2）"
         required: true
         default: "1.4.2"
       force:
@@ -38,7 +38,7 @@ on:
         required: true
         default: "true"
       version:
-        description: "Tag 名（留空则使用 work_branch）"
+        description: "Tag 名（留空则使用 work_branch 的值）"
         required: false
         default: ""
       tag_message:
@@ -74,7 +74,7 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      # —— 切到目标工作分支 —— 
+      # —— 切到目标工作分支（变量 WORK_BRANCH） —— 
       - name: Ensure local branch from origin
         run: |
           set -euo pipefail
@@ -156,7 +156,7 @@ jobs:
             git commit -m "更新子模块 ${SM_PATH} 至远端分支 ${SM_BRANCH} 的最新提交"
           fi
 
-      # —— URL 替换：src/common.rs 中将 admin.rustdesk.com 替换为自定义地址 —— 
+      # —— URL 替换：src/common.rs 中将 admin.rustdesk.com 替换为变量 admin_url —— 
       - name: Replace admin URL in src/common.rs
         run: |
           set -euo pipefail

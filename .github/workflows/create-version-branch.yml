@@ -14,7 +14,7 @@ on:
       version:
         description: "上游 Tag（如 1.4.1，仅当源类型为tag时有效）"
         required: false
-        default: "1.4.1"
+        default: "1.4.2"
       force:
         description: "强制覆盖同名远端分支（全量替换而非增量合并）"
         required: true
@@ -47,25 +47,25 @@ jobs:
           VERSION="${{ github.event.inputs.version }}"
           TARGET_DIR="${{ github.event.inputs.target_directory }}"
           
-          if [ "$SOURCE_TYPE" = "tag" ] && [ -z "$VERSION" ]; then
+          if [ "$SOURCE_TYPE" = "tag" ] && [ -z "${VERSION}" ]; then
             echo "::error::当源类型为tag时，版本号不能为空"
             echo "valid=false" >> "$GITHUB_OUTPUT"
             exit 1
           fi
           
-          if [ "$SOURCE_TYPE" = "master_branch" ] && [ -z "$TARGET_DIR" ]; then
+          if [ "$SOURCE_TYPE" = "master_branch" ] && [ -z "${TARGET_DIR}" ]; then
             echo "::error::当源类型为master_branch时，目标目录不能为空"
             echo "valid=false" >> "$GITHUB_OUTPUT"
             exit 1
           fi
           
           if [ "$SOURCE_TYPE" = "tag" ]; then
-            echo "target_branch=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "target_branch=${VERSION}" >> "$GITHUB_OUTPUT"
           else
             echo "target_branch=latest" >> "$GITHUB_OUTPUT"
           fi
           
-          echo "target_dir=$TARGET_DIR" >> "$GITHUB_OUTPUT"
+          echo "target_dir=${TARGET_DIR}" >> "$GITHUB_OUTPUT"
           echo "valid=true" >> "$GITHUB_OUTPUT"
 
   create_version_branch:
@@ -78,15 +78,14 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ needs.validate_inputs.outputs.target_branch }}
+          # 不要在此处用 ref 检出 upstream 才有的 tag/分支
 
       - name: 暂存工作流文件（防止被覆盖）
         id: stash_workflow
         run: |
+          set -euo pipefail
           WORKFLOW_FILE=".github/workflows/create-version-branch.yml"
-          # 检查工作流文件是否存在
           if [ -f "$WORKFLOW_FILE" ]; then
-            # 暂存工作流文件内容
             git stash push -u -- "$WORKFLOW_FILE"
             echo "stashed=true" >> "$GITHUB_OUTPUT"
             echo "已暂存工作流文件"
@@ -97,35 +96,41 @@ jobs:
 
       - name: Configure git identity
         run: |
+          set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --global --unset-all http.https://github.com/.extraheader || true
 
       - name: Add upstream repository
         run: |
+          set -euo pipefail
           UPSTREAM="${{ github.event.inputs.upstream_repo }}"
           git remote add upstream "https://github.com/${UPSTREAM}.git" || true
-          git fetch upstream
+          git fetch upstream --tags
 
       - name: Determine source and target information
         id: source_info
         run: |
+          set -euo pipefail
           SOURCE_TYPE="${{ github.event.inputs.source_type }}"
           VERSION="${{ github.event.inputs.version }}"
           TARGET_BRANCH="${{ needs.validate_inputs.outputs.target_branch }}"
           
           if [ "$SOURCE_TYPE" = "tag" ]; then
-            echo "source_ref=refs/tags/${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "is_tag=true" >> "$GITHUB_OUTPUT"
             echo "source_name=tag ${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "source_ref=${VERSION}" >> "$GITHUB_OUTPUT"   # 仅保存裸 tag 名
           else
-            echo "source_ref=refs/heads/master" >> "$GITHUB_OUTPUT"
+            echo "is_tag=false" >> "$GITHUB_OUTPUT"
             echo "source_name=master branch" >> "$GITHUB_OUTPUT"
+            echo "source_ref=master" >> "$GITHUB_OUTPUT"       # 上游分支名
           fi
           echo "target_branch=$TARGET_BRANCH" >> "$GITHUB_OUTPUT"
 
       - name: Check if target branch exists locally
         id: branch_check
         run: |
+          set -euo pipefail
           TARGET_BRANCH="${{ needs.validate_inputs.outputs.target_branch }}"
           if git show-ref --verify --quiet "refs/heads/${TARGET_BRANCH}"; then
             echo "branch_exists=true" >> "$GITHUB_OUTPUT"
@@ -133,36 +138,55 @@ jobs:
             echo "branch_exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Initialize new branch from upstream source (首次拉取)
+      - name: Initialize new branch from upstream source (首次拉取/强制覆盖)
         if: ${{ steps.branch_check.outputs.branch_exists == 'false' || github.event.inputs.force == 'true' }}
         run: |
-          SOURCE_REF="${{ steps.source_info.outputs.source_ref }}"
+          set -euo pipefail
           TARGET_BRANCH="${{ steps.source_info.outputs.target_branch }}"
-          
-          git checkout -B "$TARGET_BRANCH" "upstream/${SOURCE_REF#refs/heads/}"
-          git commit --allow-empty -m "Initial branch from upstream ${{ steps.source_info.outputs.source_name }}" || true
+          IS_TAG="${{ steps.source_info.outputs.is_tag }}"
+          SRC="${{ steps.source_info.outputs.source_ref }}"
+
+          git fetch upstream --tags
+
+          if [ "$IS_TAG" = "true" ]; then
+            # 拉取并以 tag 为起点创建/重置分支
+            git fetch upstream tag "$SRC" || true
+            git checkout -B "$TARGET_BRANCH" "refs/tags/$SRC"
+            git commit --allow-empty -m "Init $TARGET_BRANCH from upstream tag $SRC" || true
+          else
+            git fetch upstream "$SRC"
+            git checkout -B "$TARGET_BRANCH" "upstream/$SRC"
+            git commit --allow-empty -m "Init $TARGET_BRANCH from upstream $SRC" || true
+          fi
 
       - name: Incremental merge upstream changes (增量拉取)
         if: ${{ steps.branch_check.outputs.branch_exists == 'true' && github.event.inputs.force == 'false' }}
         run: |
-          SOURCE_REF="${{ steps.source_info.outputs.source_ref }}"
+          set -euo pipefail
           TARGET_BRANCH="${{ steps.source_info.outputs.target_branch }}"
+          IS_TAG="${{ steps.source_info.outputs.is_tag }}"
+          SRC="${{ steps.source_info.outputs.source_ref }}"
           SOURCE_NAME="${{ steps.source_info.outputs.source_name }}"
-          
-          git fetch upstream
-          
-          # 增量合并上游变更，冲突时自动采用上游版本
-          git merge --no-ff -X theirs "upstream/${SOURCE_REF#refs/heads/}" \
-            -m "Merge upstream $SOURCE_NAME into $TARGET_BRANCH (auto-resolve conflicts with upstream version)" || true
+
+          git checkout "$TARGET_BRANCH"
+          git fetch upstream --tags
+
+          if [ "$IS_TAG" = "true" ]; then
+            git fetch upstream tag "$SRC" || true
+            git merge --no-ff -X theirs "refs/tags/$SRC" \
+              -m "Merge upstream $SOURCE_NAME into $TARGET_BRANCH (auto-resolve with upstream)" || true
+          else
+            git fetch upstream "$SRC"
+            git merge --no-ff -X theirs "upstream/$SRC" \
+              -m "Merge upstream $SOURCE_NAME into $TARGET_BRANCH (auto-resolve with upstream)" || true
+          fi
 
       - name: 恢复工作流文件（确保本地版本不被覆盖）
         if: ${{ steps.stash_workflow.outputs.stashed == 'true' }}
         run: |
+          set -euo pipefail
           WORKFLOW_FILE=".github/workflows/create-version-branch.yml"
-          # 恢复暂存的工作流文件
-          git stash pop --quiet
-          
-          # 如果文件有变化，创建一个提交保留本地版本
+          git stash pop --quiet || true
           if ! git diff --quiet HEAD -- "$WORKFLOW_FILE"; then
             git add "$WORKFLOW_FILE"
             git commit -m "Preserve create-version-branch.yml from being overwritten"
@@ -173,10 +197,11 @@ jobs:
         env:
           PAT: ${{ secrets.REPO_WORKFLOW_PAT }}
         run: |
+          set -euo pipefail
           TARGET_BRANCH="${{ steps.source_info.outputs.target_branch }}"
           FORCE="${{ github.event.inputs.force }}"
           
-          if [ -n "$PAT" ]; then
+          if [ -n "${PAT:-}" ]; then
             git remote set-url origin "https://${PAT}@github.com/${GITHUB_REPOSITORY}.git"
           fi
           
@@ -189,6 +214,7 @@ jobs:
       - name: Checkout to target directory
         if: ${{ steps.source_info.outputs.target_branch == 'latest' }}
         run: |
+          set -euo pipefail
           TARGET_BRANCH="latest"
           TARGET_DIR="${{ needs.validate_inputs.outputs.target_dir }}"
           

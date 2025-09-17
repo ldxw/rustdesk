@@ -1,4 +1,4 @@
-name: 直接在分支修改：公开子模块+仅HTTPS替换+打Tag（Tag锚定分支提交）
+name: 直接在分支修改：公开子模块+仅HTTPS替换+打Tag（可控推送/重打Tag）
 
 on:
   workflow_dispatch:
@@ -14,7 +14,7 @@ on:
         required: true
         default: "false"
 
-      # 子模块（公开仓库，HTTPS）——若已就绪不会重复提交
+      # 子模块（公开仓库，HTTPS）——如不需要改动也没关系（无更改不会提交）
       submodule_url:
         description: "子模块公开仓库（HTTPS）地址"
         required: true
@@ -30,7 +30,13 @@ on:
         required: true
         default: "https://admin-hy.rs.ldxw.top"
 
-      # 打 tag 并强制让 tag 指向分支 HEAD
+      # 推送与打Tag选项（≤10 inputs）
+      push_branch:
+        description: "是否推送分支（true=推送；false=只本地提交，不推分支）"
+        type: choice
+        options: ["true", "false"]
+        required: true
+        default: "true"
       do_tag:
         description: "是否在 work_branch 的 HEAD 打 Tag（版本号见下方）"
         type: choice
@@ -45,6 +51,12 @@ on:
         description: "Tag 注释信息"
         required: false
         default: "修改内置服务器和 key"
+      retag:
+        description: "是否无条件重打Tag（true=先删远端同名Tag再重建；适合强制触发构建）"
+        type: choice
+        options: ["false", "true"]
+        required: true
+        default: "true"
 
 permissions:
   contents: write
@@ -168,8 +180,9 @@ jobs:
           echo "==> 替换后残留（前 100 行）"
           (git grep -n -E 'https://admin\.rustdesk\.com' -- ':!:libs/hbb_common' || true) | head -n 100
 
-      # 推分支（PAT，确保触发 on:push）
-      - name: Push branch via PAT
+      # 可选：推分支（由 push_branch 控制）
+      - name: Push branch via PAT (optional)
+        if: ${{ inputs.push_branch == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}
         run: |
@@ -181,7 +194,7 @@ jobs:
             git push origin "HEAD:refs/heads/${WORK_BRANCH}"
           fi
 
-      # 打 Tag：确保 Tag 指向分支 HEAD，不一致则删除远端同名 Tag 后重建并验证
+      # 打 Tag：确保 Tag 指向分支 HEAD；若 retag=true 或 mismatch/force，则删除远端Tag后重建并校验
       - name: Create/Retarget tag to branch HEAD (with verification)
         if: ${{ inputs.do_tag == 'true' }}
         env:
@@ -199,7 +212,8 @@ jobs:
           echo "Branch(${WORK_BRANCH}) SHA: ${BRANCH_SHA}"
           echo "Remote Tag(${TAG}) SHA:  ${REMOTE_TAG_SHA:-<none>}"
 
-          if [ -z "${REMOTE_TAG_SHA}" ] || [ "${REMOTE_TAG_SHA}" != "${BRANCH_SHA}" ] || [ "$FORCE" = "true" ]; then
+          # 条件：retag=true 或 tag 不存在 或 tag 指向旧提交 或 force=true -> 重打
+          if [ "${{ inputs.retag }}" = "true" ] || [ -z "${REMOTE_TAG_SHA}" ] || [ "${REMOTE_TAG_SHA}" != "${BRANCH_SHA}" ] || [ "$FORCE" = "true" ]; then
             git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
             git push origin ":refs/tags/${TAG}" || true
             git tag -d "${TAG}" 2>/dev/null || true

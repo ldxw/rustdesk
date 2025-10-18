@@ -155,7 +155,7 @@ jobs:
           fi
           if ! git diff --quiet; then
             git add -A
-            git commit -m "chore: replace https://admin.rustdesk.com -> ${NEW_URL}"
+            git commit -m "chore: replace default admin HTTPS URL"
           else
             echo "没有发现需要替换或内容已是目标值。"
           fi

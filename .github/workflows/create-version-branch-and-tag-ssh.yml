@@ -161,46 +161,49 @@ jobs:
           fi
           echo "==> 替换后残留（前 80 行）"
           (git grep -n -E 'https://admin\.rustdesk\.com' -- ':!:libs/hbb_common' || true) | head -n 80
-      # 修复语法：替换 flutter/lib/desktop/pages/connection_page.dart 81-110行代码
+      # 修复报错：替换 flutter/lib/desktop/pages/connection_page.dart 81-110行代码
       - name: Replace connection_page.dart 81-110 lines
         run: |
           set -euo pipefail
           TARGET_FILE="flutter/lib/desktop/pages/connection_page.dart"
           # 检查目标文件是否存在，不存在则报错终止
           if [ ! -f "${TARGET_FILE}" ]; then
-            echo "::error::目标文件 ${TARGET_FILE} 不存在，无法执行代码替换"
-            exit 1
+          echo "::error::目标文件 ${TARGET_FILE} 不存在，无法执行代码替换"
+          exit 1
           fi
           # 预览替换前81-110行内容
           echo "==> 替换前 ${TARGET_FILE} 81-110行内容"
           sed -n '81,110p' "${TARGET_FILE}" || echo "文件行数不足81-110行，跳过预览"
           # 用printf生成新代码到临时文件，避免YAML语法冲突
           printf "%s\n" "Widget setupServerWidget() => Flexible(" \
-                         "       child: Offstage(" \
-                         "         offstage: !(!_svcStopped.value &&" \
-                         "             stateGlobal.svcStatus.value == SvcStatus.ready &&" \
-                         "             _svcIsUsingPublicServer.value)," \
-                         "         child: Row(" \
-                         "           crossAxisAlignment: CrossAxisAlignment.center," \
-                         "           children: [],)," \
-                         "       )," \
-                         "     );" > /tmp/new_code.tmp
+                   "       child: Offstage(" \
+                   "         offstage: !(!_svcStopped.value &&" \
+                   "             stateGlobal.svcStatus.value == SvcStatus.ready &&" \
+                   "             _svcIsUsingPublicServer.value)," \
+                   "         child: Row(" \
+                   "           crossAxisAlignment: CrossAxisAlignment.center," \
+                   "           children: [],)," \
+                   "       )," \
+                   "     );" > /tmp/new_code.tmp
           # 执行替换：先删除81-110行旧代码，再插入新代码
           sed -i '81,110d' "${TARGET_FILE}"
           sed -i '81r /tmp/new_code.tmp' "${TARGET_FILE}"
           # 清理临时文件
           rm -f /tmp/new_code.tmp
-          # 预览替换后内容（从81行到setupServerWidget方法结束）
-          END_LINE=$(grep -n ");" "${TARGET_FILE}" | grep -A1 "setupServerWidget" | tail -1 | cut -d: -f1)
-          echo "==> 替换后 ${TARGET_FILE} 81-${END_LINE}行内容"
-          sed -n "81,${END_LINE}p" "${TARGET_FILE}"
+          # 修复：获取方法结束行（兼容grep未匹配的情况，默认取89行（新代码结束行））
+          END_LINE=$(grep -n ");" "${TARGET_FILE}" | grep -A1 "setupServerWidget" | tail -1 | cut -d: -f1 || echo "89")
+          # 预览替换后内容（从81行到结束行，若结束行异常则显示81-90行）
+          FINAL_END=$((END_LINE > 81 ? END_LINE : 90))
+          echo "==> 替换后 ${TARGET_FILE} 81-${FINAL_END}行内容"
+          sed -n "81,${FINAL_END}p" "${TARGET_FILE}"
           # 仅当文件有修改时，提交变更
           if ! git diff --quiet "${TARGET_FILE}"; then
-            git add "${TARGET_FILE}"
-            git commit -m "chore: replace ${TARGET_FILE} 81-110 lines (clear setup server widget content)"
+          git add "${TARGET_FILE}"
+          git commit -m "chore: replace ${TARGET_FILE} 81-110 lines (clear setup server widget content)"
           else
-            echo "==> ${TARGET_FILE} 81-110行内容已为目标值，无需替换"
+          echo "==> ${TARGET_FILE} 81-110行内容已为目标值，无需替换"
           fi
+    
       # （可选）推送分支：让“版本分支页面”也显示最新内容
       - name: Push branch (optional)
         if: ${{ inputs.push_branch == 'true' }}

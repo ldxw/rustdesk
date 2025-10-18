@@ -7,32 +7,26 @@ on:
         description: "要更新并打Tag的分支（例如 1.4.2）"
         required: true
         default: "1.4.2"
-
-      # 仅替换 https://admin.rustdesk.com
       admin_url:
-        description: "将仓库内所有 https://admin.rustdesk.com 替换为该地址（不改子模块内容）"
+        description: "替换 https://admin.rustdesk.com 为该地址"
         required: true
         default: "https://admin-hy.rs.ldxw.top"
-
-      # 子模块（公开仓库，HTTPS）
       submodule_url:
-        description: "libs/hbb_common 子模块公开仓库（HTTPS）地址"
+        description: "libs/hbb_common 子模块HTTPS地址"
         required: true
         default: "https://github.com/ldxw/rustdesk_hbb_common.git"
       submodule_branch:
-        description: "libs/hbb_common 子模块分支（auto=自动检测远端默认分支）"
+        description: "libs/hbb_common 子模块分支（auto自动检测）"
         required: true
         default: "auto"
-
-      # 推分支与打Tag选项（≤10个）
       push_branch:
-        description: "是否推送分支（true=推；false=只本地更改）"
+        description: "是否推送分支到远端"
         type: choice
         options: ["true", "false"]
         required: true
         default: "true"
       force:
-        description: "推分支/建Tag是否强制（分支用 --force-with-lease；Tag 用 -f）"
+        description: "是否强制推分支/打Tag"
         type: choice
         options: ["false", "true"]
         required: true
@@ -44,15 +38,15 @@ on:
         required: true
         default: "true"
       version:
-        description: "Tag 名（留空使用 work_branch）"
+        description: "Tag名（留空用分支名）"
         required: false
         default: ""
       tag_message:
-        description: "Tag 注释"
+        description: "Tag注释"
         required: false
         default: "修改内置服务器和 key"
       retag:
-        description: "是否强制重打Tag（先删远端同名Tag再建）"
+        description: "是否先删旧Tag再建"
         type: choice
         options: ["true", "false"]
         required: true
@@ -66,265 +60,207 @@ jobs:
     runs-on: ubuntu-latest
     env:
       WORK_BRANCH: ${{ inputs.work_branch }}
+      TARGET_FILE: "flutter/lib/desktop/pages/connection_page.dart"
     steps:
-      - name: Checkout repo (no submodules, no persisted creds)
+      # 步骤1：拉取代码（完整历史）
+      - name: Checkout repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Git identity
+      # 步骤2：配置Git身份
+      - name: Set Git identity
         run: |
           set -euo pipefail
-          git config user.name  "github-actions[bot]"
+          echo "===== 执行步骤2：配置Git身份 ====="
+          git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-      - name: Prepare branch locally
+
+      # 步骤3：准备本地分支
+      - name: Prepare local branch
         run: |
           set -euo pipefail
+          echo "===== 执行步骤3：准备本地分支 ====="
           git fetch origin --no-tags
-          if git show-ref --verify --quiet "refs/remotes/origin/${WORK_BRANCH}"; then
-            if git show-ref --verify --quiet "refs/heads/${WORK_BRANCH}"; then
-              git checkout "refs/heads/${WORK_BRANCH}"
-              git merge --ff-only "refs/remotes/origin/${WORK_BRANCH}" || true
-            else
-              git checkout -B "${WORK_BRANCH}" "refs/remotes/origin/${WORK_BRANCH}"
-            fi
-          else
-            echo "::error::远端不存在分支 origin/${WORK_BRANCH}"
+          
+          # 校验远端分支
+          if ! git show-ref --verify --quiet "refs/remotes/origin/${WORK_BRANCH}"; then
+            echo "::error::远端无 origin/${WORK_BRANCH} 分支"
             exit 1
           fi
-      # 子模块：指向公开库 + 指定/自动分支，并更新指针
-      - name: Configure submodule and update pointer
-        id: sm_update
+          
+          # 切换/创建分支
+          if git show-ref --verify --quiet "refs/heads/${WORK_BRANCH}"; then
+            git checkout "${WORK_BRANCH}"
+            git merge --ff-only "origin/${WORK_BRANCH}" || { echo "::error::分支冲突"; exit 1; }
+          else
+            git checkout -B "${WORK_BRANCH}" "origin/${WORK_BRANCH}"
+          fi
+
+      # 步骤4：配置子模块
+      - name: Configure submodule
         run: |
           set -euo pipefail
-          SM_NAME='libs/hbb_common'
-          SM_PATH='libs/hbb_common'
-          SM_URL='${{ inputs.submodule_url }}'
-          REQ_BRANCH='${{ inputs.submodule_branch }}'
+          echo "===== 执行步骤4：配置子模块 ====="
+          SM_PATH="libs/hbb_common"
+          SM_URL="${{ inputs.submodule_url }}"
+          REQ_BRANCH="${{ inputs.submodule_branch }}"
+          
+          # 校验.gitmodules
           if [ ! -f .gitmodules ]; then
-            echo "::error::.gitmodules 不存在，项目未声明子模块。"
+            echo "::error::无 .gitmodules 文件"
             exit 1
           fi
+          
+          # 自动检测子模块分支
           DETECTED_BRANCH="$REQ_BRANCH"
           if [ "$REQ_BRANCH" = "auto" ] || ! git ls-remote --heads "${SM_URL}" "${REQ_BRANCH}" | grep -q .; then
-            DETECTED_BRANCH="$(git ls-remote --symref "${SM_URL}" HEAD | awk '/^ref:/ {print $2}' | sed 's#refs/heads/##')"
-            if [ -z "${DETECTED_BRANCH}" ]; then
-              echo "::error::无法检测子模块远端默认分支，请手动指定 submodule_branch"
-              exit 1
-            fi
-            echo "Auto-detected submodule default branch: ${DETECTED_BRANCH}"
+            DETECTED_BRANCH=$(git ls-remote --symref "${SM_URL}" HEAD | awk '/^ref:/ {print $2}' | sed 's#refs/heads/##')
+            [ -z "${DETECTED_BRANCH}" ] && { echo "::error::子模块无默认分支"; exit 1; }
           fi
-          echo "sm_branch=${DETECTED_BRANCH}" >> "$GITHUB_OUTPUT"
-          git config -f .gitmodules "submodule.${SM_NAME}.url"    "${SM_URL}"
-          git config -f .gitmodules "submodule.${SM_NAME}.path"   "${SM_PATH}"
-          git config -f .gitmodules "submodule.${SM_NAME}.branch" "${DETECTED_BRANCH}"
-          git add .gitmodules
-          if ! git diff --cached --quiet; then
-            git commit -m "chore: use public submodule ${SM_URL} (${DETECTED_BRANCH})"
-          fi
+          
+          # 更新子模块配置并拉取
+          git config -f .gitmodules "submodule.${SM_PATH}.url" "${SM_URL}"
+          git config -f .gitmodules "submodule.${SM_PATH}.branch" "${DETECTED_BRANCH}"
+          [ ! -z "$(git diff .gitmodules)" ] && git commit -m "chore: update submodule config"
+          
           git submodule sync -- "${SM_PATH}"
-          git submodule set-url    "${SM_PATH}" "${SM_URL}" || true
-          git submodule set-branch --branch "${DETECTED_BRANCH}" "${SM_PATH}" || true
           git submodule update --init --remote "${SM_PATH}"
-          git -C "${SM_PATH}" fetch origin --no-tags
-          if ! git -C "${SM_PATH}" rev-parse --verify -q "refs/remotes/origin/${DETECTED_BRANCH}" >/dev/null; then
-            echo "::error::子模块远端不存在分支 origin/${DETECTED_BRANCH}"
+          git -C "${SM_PATH}" checkout -B "${DETECTED_BRANCH}" "origin/${DETECTED_BRANCH}"
+          [ ! -z "$(git diff "${SM_PATH}")" ] && git commit -m "chore: bump submodule"
+
+      # 步骤5：替换admin地址
+      - name: Replace admin URL
+        run: |
+          set -euo pipefail
+          echo "===== 执行步骤5：替换admin地址 ====="
+          OLD_URL="https://admin.rustdesk.com"
+          NEW_URL="${{ inputs.admin_url }}"
+          NEW_URL_ESC="${NEW_URL//&/\\&}"
+          
+          # 批量替换
+          FILES=$(git grep -l -E "${OLD_URL//./\\.}" -- ':!:libs/hbb_common' || true)
+          [ -n "${FILES}" ] && echo "${FILES}" | xargs -r sed -i -e "s|${OLD_URL}|${NEW_URL_ESC}|g"
+          
+          # 提交变更
+          [ ! -z "$(git diff)" ] && git commit -m "chore: replace admin URL to ${NEW_URL}"
+
+      # 步骤6：替换connection_page.dart代码
+      - name: Replace target dart file
+        run: |
+          set -euo pipefail
+          echo "===== 执行步骤6：替换dart文件 ====="
+          
+          # 校验文件
+          if [ ! -f "${TARGET_FILE}" ]; then
+            echo "::error::${TARGET_FILE} 不存在"
             exit 1
           fi
-          git -C "${SM_PATH}" checkout -B "${DETECTED_BRANCH}" "origin/${DETECTED_BRANCH}"
-          git add "${SM_PATH}"
-          if ! git diff --cached --quiet; then
-            git commit -m "chore: bump submodule ${SM_PATH} to origin/${DETECTED_BRANCH} latest"
-          fi
-      # 仅替换 https://admin.rustdesk.com（排除子模块目录）
-      - name: Replace admin HTTPS URLs (exclude submodule)
-        run: |
-          set -euo pipefail
-          NEW_URL='${{ inputs.admin_url }}'
-          echo "==> 替换前命中（前 80 行）"
-          (git grep -n -E 'https://admin\.rustdesk\.com' -- ':!:libs/hbb_common' || true) | head -n 80
-          files_http=$(git grep -l -E 'https://admin\.rustdesk\.com' -- ':!:libs/hbb_common' || true)
-          if [ -n "${files_http}" ]; then
-            new_esc=${NEW_URL//&/\\&}
-            echo "${files_http}" | xargs -r sed -i -e "s|https://admin\.rustdesk\.com|${new_esc}|g"
-          fi
-          if [ -f "src/common.rs" ]; then
-            echo "==> src/common.rs 替换后关键行："
-            (grep -nE 'admin\.rustdesk\.com|rs\.ldxw\.top|admin-hy' src/common.rs || true) | head -n 50
-          fi
-          if ! git diff --quiet; then
-            git add -A
-            git commit -m "chore: replace default admin HTTPS URL"
-          else
-            echo "没有发现需要替换或内容已是目标值。"
-          fi
-          echo "==> 替换后残留（前 80 行）"
-          (git grep -n -E 'https://admin\.rustdesk\.com' -- ':!:libs/hbb_common' || true) | head -n 80
-      # 修复报错：替换 flutter/lib/desktop/pages/connection_page.dart 81-110行代码
-      - name: Replace connection_page.dart 81-110 lines
-        run: |
-          set -euo pipefail
-          TARGET_FILE="flutter/lib/desktop/pages/connection_page.dart"
-          # 检查目标文件是否存在，不存在则报错终止
-          if [ ! -f "${TARGET_FILE}" ]; then
-          echo "::error::目标文件 ${TARGET_FILE} 不存在，无法执行代码替换"
-          exit 1
-          fi
-          # 预览替换前81-110行内容
-          echo "==> 替换前 ${TARGET_FILE} 81-110行内容"
-          sed -n '81,110p' "${TARGET_FILE}" || echo "文件行数不足81-110行，跳过预览"
-          # 用printf生成新代码到临时文件，避免YAML语法冲突
+          
+          # 生成新代码
           printf "%s\n" "Widget setupServerWidget() => Flexible(" \
-                   "       child: Offstage(" \
-                   "         offstage: !(!_svcStopped.value &&" \
-                   "             stateGlobal.svcStatus.value == SvcStatus.ready &&" \
-                   "             _svcIsUsingPublicServer.value)," \
-                   "         child: Row(" \
-                   "           crossAxisAlignment: CrossAxisAlignment.center," \
-                   "           children: [],)," \
-                   "       )," \
-                   "     );" > /tmp/new_code.tmp
-          # 执行替换：先删除81-110行旧代码，再插入新代码
+                         "       child: Offstage(" \
+                         "         offstage: !(!_svcStopped.value &&" \
+                         "             stateGlobal.svcStatus.value == SvcStatus.ready &&" \
+                         "             _svcIsUsingPublicServer.value)," \
+                         "         child: Row(" \
+                         "           crossAxisAlignment: CrossAxisAlignment.center," \
+                         "           children: [],)," \
+                         "       )," \
+                         "     );" > /tmp/new_code.tmp
+          
+          # 替换代码
           sed -i '81,110d' "${TARGET_FILE}"
           sed -i '81r /tmp/new_code.tmp' "${TARGET_FILE}"
-          # 清理临时文件
           rm -f /tmp/new_code.tmp
-          # 修复：获取方法结束行（兼容grep未匹配的情况，默认取89行（新代码结束行））
-          END_LINE=$(grep -n ");" "${TARGET_FILE}" | grep -A1 "setupServerWidget" | tail -1 | cut -d: -f1 || echo "89")
-          # 预览替换后内容（从81行到结束行，若结束行异常则显示81-90行）
-          FINAL_END=$((END_LINE > 81 ? END_LINE : 90))
-          echo "==> 替换后 ${TARGET_FILE} 81-${FINAL_END}行内容"
-          sed -n "81,${FINAL_END}p" "${TARGET_FILE}"
-          # 仅当文件有修改时，提交变更
-          if ! git diff --quiet "${TARGET_FILE}"; then
-          git add "${TARGET_FILE}"
-          git commit -m "chore: replace ${TARGET_FILE} 81-110 lines (clear setup server widget content)"
-          else
-          echo "==> ${TARGET_FILE} 81-110行内容已为目标值，无需替换"
-          fi
-    
-      # （可选）推送分支：让“版本分支页面”也显示最新内容
-      - name: Push branch (optional)
+          
+          # 提交变更
+          [ ! -z "$(git diff "${TARGET_FILE}")" ] && git commit -m "chore: replace ${TARGET_FILE} 81-110 lines"
+
+      # 步骤7：推送分支+存储远端SHA（关键：确保变量有值）
+      - name: Push branch & save remote SHA
         if: ${{ inputs.push_branch == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}
         run: |
           set -euo pipefail
+          echo "===== 执行步骤7：推送分支 ====="
+          # 配置远端地址
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          
+          # 推送分支
           if [ "${{ inputs.force }}" = "true" ]; then
-            git push --force-with-lease origin "HEAD:refs/heads/${WORK_BRANCH}"
+            git push --force-with-lease origin "${WORK_BRANCH}"
           else
-            git push origin "HEAD:refs/heads/${WORK_BRANCH}"
+            git push origin "${WORK_BRANCH}"
           fi
-      # 打 Tag：锚定“分支HEAD”并校验远端 Tag 指向远端分支 HEAD
-      - name: Create/retarget tag at branch HEAD (verified)
+          
+          # 强制获取远端SHA并存储（避免空值）
+          REMOTE_BRANCH_SHA=$(git ls-remote origin "refs/heads/${WORK_BRANCH}" | awk '{print $1}')
+          echo "REMOTE_BRANCH_SHA=${REMOTE_BRANCH_SHA}" >> "$GITHUB_ENV"
+          echo "✅ 远端分支SHA：${REMOTE_BRANCH_SHA}"
+
+      # 步骤8：打Tag+校验（修复空格语法+变量兜底）
+      - name: Create & verify Tag
         if: ${{ inputs.do_tag == 'true' }}
-        id: tag_step
         env:
           GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}
         run: |
           set -euo pipefail
-          TAG_IN='${{ inputs.version }}'; TAG="$TAG_IN"
-          if [ -z "$TAG" ]; then TAG="${WORK_BRANCH}"; fi
-          MSG='${{ inputs.tag_message }}'
-          FORCE='${{ inputs.force }}'
-          RETAG='${{ inputs.retag }}'
-          # 获取本地分支HEAD的SHA
-          BRANCH_REF="refs/heads/${WORK_BRANCH}"
-          LOCAL_BRANCH_SHA="$(git rev-parse "${BRANCH_REF}^{commit}")"
-          echo "Local ${BRANCH_REF} HEAD: ${LOCAL_BRANCH_SHA}"
-          # 获取远端分支HEAD的SHA（确保与本地一致）
-          REMOTE_BRANCH_SHA="$(git ls-remote origin "refs/heads/${WORK_BRANCH}" | awk '{print $1}')"
-          echo "Remote refs/heads/${WORK_BRANCH}: ${REMOTE_BRANCH_SHA}"
-          # 配置远端地址（带权限）
+          echo "===== 执行步骤8：打Tag+校验 ====="
+          # 1. 定义变量（避免空值）
+          TAG="${{ inputs.version || env.WORK_BRANCH }}"
+          TAG_MSG="${{ inputs.tag_message }}"
+          LOCAL_SHA=$(git rev-parse "${WORK_BRANCH}^{commit}")
+          # 变量兜底：未推分支时手动获取远端SHA
+          REMOTE_BRANCH_SHA="${{ env.REMOTE_BRANCH_SHA }}"
+          if [ -z "${REMOTE_BRANCH_SHA}" ]; then
+            REMOTE_BRANCH_SHA=$(git ls-remote origin "refs/heads/${WORK_BRANCH}" | awk '{print $1}')
+            [ -z "${REMOTE_BRANCH_SHA}" ] && { echo "::error::无法获取远端分支SHA"; exit 1; }
+          fi
+          
+          # 2. 处理旧Tag
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          # 按需删除远端同名Tag
-          if [ "$RETAG" = "true" ]; then
-            git push origin ":refs/tags/${TAG}" || true
+          if [ "${{ inputs.retag }}" = "true" ]; then
+            git push origin ":refs/tags/${TAG}" || echo "ℹ️ 无旧Tag"
+            git tag -d "${TAG}" 2>/dev/null || true
           fi
-          # 删除本地旧Tag，在本地分支HEAD重建带注释的Tag
-          git tag -d "${TAG}" 2>/dev/null || true
-          if [ "$FORCE" = "true" ]; then
-            git tag -a -f "${TAG}" -m "${MSG}" "${LOCAL_BRANCH_SHA}"
-          else
-            git tag -a "${TAG}" -m "${MSG}" "${LOCAL_BRANCH_SHA}"
-          fi
-          # 推送Tag到远端
+          
+          # 3. 创建并推送Tag
+          git tag -a "${TAG}" -m "${TAG_MSG}" "${LOCAL_SHA}"
           git push origin "refs/tags/${TAG}"
-          # 解析远端Tag指向的实际提交SHA（处理注释Tag的剥离逻辑）
-          REMOTE_TAG_OBJ_SHA="$(git ls-remote --tags origin "refs/tags/${TAG}" | awk '{print $1}')"
-          REMOTE_TAG_PEELED_SHA="$(git ls-remote --tags origin "refs/tags/${TAG}^{}" | awk '{print $1}')"
-          REMOTE_COMMIT_SHA="${REMOTE_TAG_PEELED_SHA:-$REMOTE_TAG_OBJ_SHA}"
-          echo "Remote Tag Peeled (实际指向提交): ${REMOTE_COMMIT_SHA:-<none>}"
-          # 校验：远端Tag必须指向远端分支HEAD
-          if [ -z "${REMOTE_COMMIT_SHA}" ] || [ -z "${REMOTE_BRANCH_SHA}" ] || [ "${REMOTE_COMMIT_SHA}" != "${REMOTE_BRANCH_SHA}" ]; then
-            echo "::error::校验失败：远端Tag ${TAG}（${REMOTE_COMMIT_SHA:-<none>}）未指向远端分支 ${WORK_BRANCH} 的HEAD（${REMOTE_BRANCH_SHA:-<none>}）"
-            echo "提示：若需分支同步更新，请将 inputs.push_branch 设为 true"
+          echo "✅ 推送Tag：${TAG}（指向SHA：${LOCAL_SHA}）"
+          
+          # 4. 校验Tag（修复空格语法：去掉 ${TAG}^{ } 中的空格）
+          REMOTE_TAG_SHA=$(git ls-remote --tags origin "refs/tags/${TAG}^{}" | awk '{print $1}')
+          [ -z "${REMOTE_TAG_SHA}" ] && REMOTE_TAG_SHA=$(git ls-remote --tags origin "refs/tags/${TAG}" | awk '{print $1}')
+          
+          # 5. 校验Tag与分支同步
+          if [ "${REMOTE_TAG_SHA}" != "${REMOTE_BRANCH_SHA}" ]; then
+            echo "::error::Tag SHA(${REMOTE_TAG_SHA}) 与分支SHA(${REMOTE_BRANCH_SHA}) 不一致"
             exit 1
           fi
-          echo "tag_name=${TAG}" >> "$GITHUB_OUTPUT"
-      - name: Show final refs and snippet (最终结果校验)
+          echo "✅ Tag校验通过"
+
+      # 步骤9：最终校验（无语法错误）
+      - name: Final verification
         run: |
           set -euo pipefail
-          # 显示本地分支HEAD信息
-          echo "---- Local refs/heads/${WORK_BRANCH} 分支信息 ----"
-          git show -s --format="Commit SHA: %H%n提交时间: %ad%n提交说明: %s" "refs/heads/${WORK_BRANCH}"
-          # 显示src/common.rs替换结果（确认URL替换）
-          if [ -f "src/common.rs" ]; then
-            echo -e "\n---- src/common.rs 关键行（URL替换校验） ----"
-            (grep -nE 'admin\.rustdesk\.com|rs\.ldxw\.top|admin-hy' src/common.rs || true) | head -n 80
-          fi
-          # 显示connection_page.dart替换结果（确认代码替换）
-          if [ -f "flutter/lib/desktop/pages/connection_page.dart" ]; then
-            echo -e "\n---- connection_page.dart 关键行（代码替换校验） ----"
-            grep -A10 -B2 "setupServerWidget" "flutter/lib/desktop/pages/connection_page.dart" || true
-          fi
-          # 显示远端Tag信息（若已打Tag）
-          if [ "${{ inputs.do_tag }}" = "true" ]; then
-            TAG_IN='${{ inputs.version }}'; TAG="$TAG_IN"; if [ -z "$TAG" ]; then TAG="${WORK_BRANCH}"; fi
-            echo -e "\n---- Remote Tag ${TAG} 信息（Tag校验） ----"
-            git show -s --format="Tag指向SHA: %H%n提交时间: %ad%n提交说明: %s" "refs/tags/${TAG}^{ }" || git show -s --format="Tag指向SHA: %H%n提交时间: %ad%n提交说明: %s" "refs/tags/${TAG}"
-          fi
-          # 解析远端 Tag 指向的“提交 SHA”（处理注释Tag的剥离）
-          REMOTE_TAG_OBJ_SHA="$(git ls-remote --tags origin "refs/tags/${TAG}"       | awk '{print $1}')"
-          REMOTE_TAG_PEELED_SHA="$(git ls-remote --tags origin "refs/tags/${TAG}^{}" | awk '{print $1}')"
-          if [ -n "${REMOTE_TAG_PEELED_SHA}" ]; then
-            REMOTE_COMMIT_SHA="${REMOTE_TAG_PEELED_SHA}"
-          else
-            REMOTE_COMMIT_SHA="${REMOTE_TAG_OBJ_SHA}"
-          fi
-          echo "Remote Tag Peeled: ${REMOTE_COMMIT_SHA:-<none>}"
-          # 校验：远端 Tag 指向 == 远端分支 HEAD（若未推分支，此校验可能不等；此时你希望分支也更新，请打开 push_branch）
-          if [ -z "${REMOTE_COMMIT_SHA}" ] || [ -z "${REMOTE_BRANCH_SHA}" ] || [ "${REMOTE_COMMIT_SHA}" != "${REMOTE_BRANCH_SHA}" ]; then
-            echo "::error::校验失败：远端Tag ${TAG}（${REMOTE_COMMIT_SHA:-<none>}）未指向远端分支 ${WORK_BRANCH} 的HEAD（${REMOTE_BRANCH_SHA:-<none>}）。"
-            echo "提示：若你希望分支也更新，请将输入 push_branch 设为 true。"
-            exit 1
-          fi
-          echo "tag_name=${TAG}" >> "$GITHUB_OUTPUT"
-      - name: Show final verification results
-        run: |
-          set -euo pipefail
-          echo -e "\n===== 最终结果校验 ====="
-
-          # 1. 本地分支信息
-          echo -e "\n1. 本地分支 ${WORK_BRANCH} 信息"
-          git show -s --format="  提交SHA：%H\n  提交时间：%ad\n  最近提交说明：%s" "${WORK_BRANCH}" || echo "  本地分支信息查询正常"
-
-          # 2. connection_page.dart 替换结果校验
-          TARGET_FILE="flutter/lib/desktop/pages/connection_page.dart"
-          echo -e "\n2. ${TARGET_FILE} 替换结果"
-          if grep -q "children: \[\]," "${TARGET_FILE}"; then
-          echo "  ✅ 替换成功：已检测到新代码特征（children: []）"
-          else
-          echo "  ❗ 未检测到新代码特征，建议核查文件内容"
-          fi
-
-          # 3. Tag信息校验（仅当开启打Tag时）
+          echo "===== 执行步骤9：最终校验 ====="
+          # 1. 分支信息
+          echo -e "\n1. 本地分支信息"
+          git show -s --format="  SHA：%H\n  说明：%s" "${WORK_BRANCH}"
+          
+          # 2. dart文件替换结果
+          echo -e "\n2. Dart文件替换结果"
+          grep -q "children: \[\]," "${TARGET_FILE}" && echo "  ✅ 替换成功" || echo "  ❗ 替换待核查"
+          
+          # 3. Tag信息
           if [ "${{ inputs.do_tag == 'true' }}" = "true" ]; then
-          TAG=${{ inputs.version || env.WORK_BRANCH }}
-          echo -e "\n3. Tag ${TAG} 信息"
-          git tag -l "${TAG}" --format="  Tag存在：%1.1s\n  Tag注释：%(contents)" || echo "  ✅ Tag创建正常"
+            TAG="${{ inputs.version || env.WORK_BRANCH }}"
+            echo -e "\n3. Tag信息"
+            git tag -l "${TAG}" --format="  存在：%1.1s\n  注释：%(contents)"
           fi
-
-          echo -e "\n===== 校验完成，无语法报错 ====="
+          echo -e "\n===== 工作流执行完成 ====="
+          

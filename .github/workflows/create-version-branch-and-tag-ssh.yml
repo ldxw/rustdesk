@@ -293,7 +293,7 @@ jobs:
           echo "✅ 已存储远端分支 ${WORK_BRANCH} SHA：${REMOTE_BRANCH_SHA}"
           
 
-      # 步骤8：创建Tag并校验（无语法错误，确保与分支同步）
+            # 步骤8：创建 & 校验Tag（同步最新本地SHA，解决不一致问题）
       - name: Create & verify Tag
         if: ${{ inputs.do_tag == 'true' }}
         env:
@@ -301,48 +301,50 @@ jobs:
         run: |
           set -euo pipefail
           echo "===== 执行步骤8：创建并校验Tag ====="
-          # 1. 定义变量（兜底逻辑，避免空值）
+          # 1. 定义变量（关键修复：推送后重新获取本地分支最新SHA）
           TAG="${{ inputs.version }}"
-          [ -z "${TAG}" ] && TAG="${WORK_BRANCH}"  # 留空则用分支名
+          [ -z "${TAG}" ] && TAG="${WORK_BRANCH}"
           TAG_MSG="${{ inputs.tag_message }}"
-          LOCAL_BRANCH_SHA=$(git rev-parse "${WORK_BRANCH}^{commit}")  # 本地分支HEAD SHA
+          # 修复点：推送分支后，重新拉取本地分支最新状态，再获取SHA
+          git pull origin "${WORK_BRANCH}" --ff-only  # 拉取远端最新分支，确保本地与远端同步
+          LOCAL_BRANCH_SHA=$(git rev-parse "${WORK_BRANCH}^{commit}")  # 此时本地SHA已与远端一致
           
-          # 2. 补全远端SHA（未推分支时手动获取，双重兜底）
+          # 2. 补全远端SHA（双重兜底）
           REMOTE_BRANCH_SHA="${{ env.REMOTE_BRANCH_SHA }}"
           if [ -z "${REMOTE_BRANCH_SHA}" ]; then
             REMOTE_BRANCH_SHA=$(git ls-remote origin "refs/heads/${WORK_BRANCH}" | awk '{print $1}')
-            [ -z "${REMOTE_BRANCH_SHA}" ] && { echo "::error::无法获取远端分支SHA，请先推送分支"; exit 1; }
+            [ -z "${REMOTE_BRANCH_SHA}" ] && { echo "::error::无法获取远端分支SHA"; exit 1; }
           fi
           
-          # 3. 打印核心信息，便于日志核查
+          # 3. 打印核心信息（此时本地与远端SHA应一致）
           echo "✅ 核心配置："
           echo "  - Tag名称：${TAG}"
           echo "  - Tag注释：${TAG_MSG}"
           echo "  - 本地分支SHA：${LOCAL_BRANCH_SHA}"
           echo "  - 远端分支SHA：${REMOTE_BRANCH_SHA}"
           
-          # 4. 处理旧Tag（按配置删除，避免冲突）
+          # 4. 处理旧Tag（按配置删除）
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           if [ "${{ inputs.retag }}" = "true" ]; then
             git push origin ":refs/tags/${TAG}" || echo "ℹ️ 远端无旧Tag ${TAG}，无需删除"
-            git tag -d "${TAG}" 2>/dev/null || true  # 删除本地旧Tag
+            git tag -d "${TAG}" 2>/dev/null || true
           fi
           
-          # 5. 创建并推送新Tag
+          # 5. 创建并推送新Tag（此时Tag指向的SHA与远端分支一致）
           git tag -a "${TAG}" -m "${TAG_MSG}" "${LOCAL_BRANCH_SHA}"
           git push origin "refs/tags/${TAG}"
           echo "✅ 已创建并推送Tag：${TAG}（指向SHA：${LOCAL_BRANCH_SHA}）"
           
-          # 6. 校验Tag（无空格语法，确保与分支同步）
-          REMOTE_TAG_SHA=$(git ls-remote --tags origin "refs/tags/${TAG}^{}" | awk '{print $1}')  # 无多余空格
+          # 6. 校验Tag SHA与远端分支SHA
+          REMOTE_TAG_SHA=$(git ls-remote --tags origin "refs/tags/${TAG}^{}" | awk '{print $1}')
           [ -z "${REMOTE_TAG_SHA}" ] && REMOTE_TAG_SHA=$(git ls-remote --tags origin "refs/tags/${TAG}" | awk '{print $1}')
           
-          # 7. 校验Tag与分支SHA一致性
           if [ "${REMOTE_TAG_SHA}" != "${REMOTE_BRANCH_SHA}" ]; then
             echo "::error::Tag校验失败：Tag SHA(${REMOTE_TAG_SHA}) ≠ 远端分支SHA(${REMOTE_BRANCH_SHA})"
             exit 1
           fi
           echo "✅ Tag校验通过：${TAG} 与远端分支 ${WORK_BRANCH} 完全同步"
+          
 
       # 步骤9：最终校验（确认所有操作结果，无语法截断）
       - name: Final verification

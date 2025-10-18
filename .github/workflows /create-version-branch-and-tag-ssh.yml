@@ -1,0 +1,240 @@
+name: 更新分支并打Tag：子模块 + URL替换 + Tag锚定分支HEAD
+
+on:
+  workflow_dispatch:
+    inputs:
+      work_branch:
+        description: "要更新并打Tag的分支（例如 1.4.2）"
+        required: true
+        default: "1.4.2"
+
+      # 仅替换 https://admin.rustdesk.com
+      admin_url:
+        description: "将仓库内所有 https://admin.rustdesk.com 替换为该地址（不改子模块内容）"
+        required: true
+        default: "https://admin-hy.rs.ldxw.top"
+
+      # 子模块（公开仓库，HTTPS）
+      submodule_url:
+        description: "libs/hbb_common 子模块公开仓库（HTTPS）地址"
+        required: true
+        default: "https://github.com/ldxw/rustdesk_hbb_common.git"
+      submodule_branch:
+        description: "libs/hbb_common 子模块分支（auto=自动检测远端默认分支）"
+        required: true
+        default: "auto"
+
+      # 推分支与打Tag选项（≤10个）
+      push_branch:
+        description: "是否推送分支（true=推；false=只本地更改）"
+        type: choice
+        options: ["true", "false"]
+        required: true
+        default: "true"
+      force:
+        description: "推分支/建Tag是否强制（分支用 --force-with-lease；Tag 用 -f）"
+        type: choice
+        options: ["false", "true"]
+        required: true
+        default: "false"
+      do_tag:
+        description: "是否在分支HEAD打Tag"
+        type: choice
+        options: ["true", "false"]
+        required: true
+        default: "true"
+      version:
+        description: "Tag 名（留空使用 work_branch）"
+        required: false
+        default: ""
+      tag_message:
+        description: "Tag 注释"
+        required: false
+        default: "修改内置服务器和 key"
+      retag:
+        description: "是否强制重打Tag（先删远端同名Tag再建）"
+        type: choice
+        options: ["true", "false"]
+        required: true
+        default: "true"
+
+permissions:
+  contents: write
+
+jobs:
+  update_and_tag:
+    runs-on: ubuntu-latest
+    env:
+      WORK_BRANCH: ${{ inputs.work_branch }}
+    steps:
+      - name: Checkout repo (no submodules, no persisted creds)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Git identity
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Prepare branch locally
+        run: |
+          set -euo pipefail
+          git fetch origin --no-tags
+          if git show-ref --verify --quiet "refs/remotes/origin/${WORK_BRANCH}"; then
+            if git show-ref --verify --quiet "refs/heads/${WORK_BRANCH}"; then
+              git checkout "refs/heads/${WORK_BRANCH}"
+              git merge --ff-only "refs/remotes/origin/${WORK_BRANCH}" || true
+            else
+              git checkout -B "${WORK_BRANCH}" "refs/remotes/origin/${WORK_BRANCH}"
+            fi
+          else
+            echo "::error::远端不存在分支 origin/${WORK_BRANCH}"
+            exit 1
+          fi
+      # 子模块：指向公开库 + 指定/自动分支，并更新指针
+      - name: Configure submodule and update pointer
+        id: sm_update
+        run: |
+          set -euo pipefail
+          SM_NAME='libs/hbb_common'
+          SM_PATH='libs/hbb_common'
+          SM_URL='${{ inputs.submodule_url }}'
+          REQ_BRANCH='${{ inputs.submodule_branch }}'
+          if [ ! -f .gitmodules ]; then
+            echo "::error::.gitmodules 不存在，项目未声明子模块。"
+            exit 1
+          fi
+          DETECTED_BRANCH="$REQ_BRANCH"
+          if [ "$REQ_BRANCH" = "auto" ] || ! git ls-remote --heads "${SM_URL}" "${REQ_BRANCH}" | grep -q .; then
+            DETECTED_BRANCH="$(git ls-remote --symref "${SM_URL}" HEAD | awk '/^ref:/ {print $2}' | sed 's#refs/heads/##')"
+            if [ -z "${DETECTED_BRANCH}" ]; then
+              echo "::error::无法检测子模块远端默认分支，请手动指定 submodule_branch"
+              exit 1
+            fi
+            echo "Auto-detected submodule default branch: ${DETECTED_BRANCH}"
+          fi
+          echo "sm_branch=${DETECTED_BRANCH}" >> "$GITHUB_OUTPUT"
+          git config -f .gitmodules "submodule.${SM_NAME}.url"    "${SM_URL}"
+          git config -f .gitmodules "submodule.${SM_NAME}.path"   "${SM_PATH}"
+          git config -f .gitmodules "submodule.${SM_NAME}.branch" "${DETECTED_BRANCH}"
+          git add .gitmodules
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: use public submodule ${SM_URL} (${DETECTED_BRANCH})"
+          fi
+          git submodule sync -- "${SM_PATH}"
+          git submodule set-url    "${SM_PATH}" "${SM_URL}" || true
+          git submodule set-branch --branch "${DETECTED_BRANCH}" "${SM_PATH}" || true
+          git submodule update --init --remote "${SM_PATH}"
+          git -C "${SM_PATH}" fetch origin --no-tags
+          if ! git -C "${SM_PATH}" rev-parse --verify -q "refs/remotes/origin/${DETECTED_BRANCH}" >/dev/null; then
+            echo "::error::子模块远端不存在分支 origin/${DETECTED_BRANCH}"
+            exit 1
+          fi
+          git -C "${SM_PATH}" checkout -B "${DETECTED_BRANCH}" "origin/${DETECTED_BRANCH}"
+          git add "${SM_PATH}"
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: bump submodule ${SM_PATH} to origin/${DETECTED_BRANCH} latest"
+          fi
+      # 仅替换 https://admin.rustdesk.com（排除子模块目录）
+      - name: Replace admin HTTPS URLs (exclude submodule)
+        run: |
+          set -euo pipefail
+          NEW_URL='${{ inputs.admin_url }}'
+          echo "==> 替换前命中（前 80 行）"
+          (git grep -n -E 'https://admin\.rustdesk\.com' -- ':!:libs/hbb_common' || true) | head -n 80
+          files_http=$(git grep -l -E 'https://admin\.rustdesk\.com' -- ':!:libs/hbb_common' || true)
+          if [ -n "${files_http}" ]; then
+            new_esc=${NEW_URL//&/\\&}
+            echo "${files_http}" | xargs -r sed -i -e "s|https://admin\.rustdesk\.com|${new_esc}|g"
+          fi
+          if [ -f "src/common.rs" ]; then
+            echo "==> src/common.rs 替换后关键行："
+            (grep -nE 'admin\.rustdesk\.com|rs\.ldxw\.top|admin-hy' src/common.rs || true) | head -n 50
+          fi
+          if ! git diff --quiet; then
+            git add -A
+            git commit -m "chore: replace https://admin.rustdesk.com -> ${NEW_URL}"
+          else
+            echo "没有发现需要替换或内容已是目标值。"
+          fi
+          echo "==> 替换后残留（前 80 行）"
+          (git grep -n -E 'https://admin\.rustdesk\.com' -- ':!:libs/hbb_common' || true) | head -n 80
+      # （可选）推送分支：让“版本分支页面”也显示最新内容
+      - name: Push branch (optional)
+        if: ${{ inputs.push_branch == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}
+        run: |
+          set -euo pipefail
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if [ "${{ inputs.force }}" = "true" ]; then
+            git push --force-with-lease origin "HEAD:refs/heads/${WORK_BRANCH}"
+          else
+            git push origin "HEAD:refs/heads/${WORK_BRANCH}"
+          fi
+      # 打 Tag：锚定“分支HEAD”并校验远端 Tag 指向远端分支 HEAD
+      - name: Create/retarget tag at branch HEAD (verified)
+        if: ${{ inputs.do_tag == 'true' }}
+        id: tag_step
+        env:
+          GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}
+        run: |
+          set -euo pipefail
+          TAG_IN='${{ inputs.version }}'; TAG="$TAG_IN"
+          if [ -z "$TAG" ]; then TAG="${WORK_BRANCH}"; fi
+          MSG='${{ inputs.tag_message }}'
+          FORCE='${{ inputs.force }}'
+          RETAG='${{ inputs.retag }}'
+          # 本地分支提交
+          BRANCH_REF="refs/heads/${WORK_BRANCH}"
+          LOCAL_BRANCH_SHA="$(git rev-parse "${BRANCH_REF}^{commit}")"
+          echo "Local ${BRANCH_REF} HEAD: ${LOCAL_BRANCH_SHA}"
+          # 远端分支提交（推分支后再取，保证一致）
+          REMOTE_BRANCH_SHA="$(git ls-remote origin "refs/heads/${WORK_BRANCH}" | awk '{print $1}')"
+          echo "Remote refs/heads/${WORK_BRANCH}: ${REMOTE_BRANCH_SHA}"
+          # （按需）先删远端同名 Tag
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if [ "$RETAG" = "true" ]; then
+            git push origin ":refs/tags/${TAG}" || true
+          fi
+          # 删除本地旧 Tag 并在本地分支 HEAD 上重建注释 Tag
+          git tag -d "${TAG}" 2>/dev/null || true
+          if [ "$FORCE" = "true" ]; then
+            git tag -a -f "${TAG}" -m "${MSG}" "${LOCAL_BRANCH_SHA}"
+          else
+            git tag -a "${TAG}" -m "${MSG}" "${LOCAL_BRANCH_SHA}"
+          fi
+          # 仅推送 Tag
+          git push origin "refs/tags/${TAG}"
+          # 解析远端 Tag 指向的“提交 SHA”（处理注释Tag的剥离）
+          REMOTE_TAG_OBJ_SHA="$(git ls-remote --tags origin "refs/tags/${TAG}"       | awk '{print $1}')"
+          REMOTE_TAG_PEELED_SHA="$(git ls-remote --tags origin "refs/tags/${TAG}^{}" | awk '{print $1}')"
+          if [ -n "${REMOTE_TAG_PEELED_SHA}" ]; then
+            REMOTE_COMMIT_SHA="${REMOTE_TAG_PEELED_SHA}"
+          else
+            REMOTE_COMMIT_SHA="${REMOTE_TAG_OBJ_SHA}"
+          fi
+          echo "Remote Tag Peeled: ${REMOTE_COMMIT_SHA:-<none>}"
+          # 校验：远端 Tag 指向 == 远端分支 HEAD（若未推分支，此校验可能不等；此时你希望分支也更新，请打开 push_branch）
+          if [ -z "${REMOTE_COMMIT_SHA}" ] || [ -z "${REMOTE_BRANCH_SHA}" ] || [ "${REMOTE_COMMIT_SHA}" != "${REMOTE_BRANCH_SHA}" ]; then
+            echo "::error::校验失败：远端Tag ${TAG}（${REMOTE_COMMIT_SHA:-<none>}）未指向远端分支 ${WORK_BRANCH} 的HEAD（${REMOTE_BRANCH_SHA:-<none>}）。"
+            echo "提示：若你希望分支也更新，请将输入 push_branch 设为 true。"
+            exit 1
+          fi
+          echo "tag_name=${TAG}" >> "$GITHUB_OUTPUT"
+      - name: Show final refs and snippet
+        run: |
+          set -euo pipefail
+          echo "---- Local refs/heads/${WORK_BRANCH} ----"
+          git show -s --format="Commit %H%nDate   %ad%n%n%s" "refs/heads/${WORK_BRANCH}"
+          if [ -f "src/common.rs" ]; then
+            echo "---- src/common.rs 关键行（确认替换） ----"
+            (grep -nE 'admin\.rustdesk\.com|rs\.ldxw\.top|admin-hy' src/common.rs || true) | head -n 80
+          fi
+          if [ "${{ inputs.do_tag }}" = "true" ]; then
+            TAG_IN='${{ inputs.version }}'; TAG="$TAG_IN"; if [ -z "$TAG" ]; then TAG="${WORK_BRANCH}"; fi
+            echo "---- Remote Tag ${TAG} (peeled) ----"
+            git show -s --format="Commit %H%nDate   %ad%n%n%s" "refs/tags/${TAG}^{ }" || git show -s --format="Commit %H%nDate   %ad%n%n%s" "refs/tags/${TAG}"
+          fi

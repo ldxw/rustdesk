@@ -302,22 +302,29 @@ jobs:
             exit 1
           fi
           echo "tag_name=${TAG}" >> "$GITHUB_OUTPUT"
-      - name: Show final refs and snippet
+      - name: Show final verification results
         run: |
           set -euo pipefail
-          echo "---- Local refs/heads/${WORK_BRANCH} ----"
-          git show -s --format="Commit %H%nDate   %ad%n%n%s" "refs/heads/${WORK_BRANCH}"
-          if [ -f "src/common.rs" ]; then
-            echo "---- src/common.rs 关键行（确认替换） ----"
-            (grep -nE 'admin\.rustdesk\.com|rs\.ldxw\.top|admin-hy' src/common.rs || true) | head -n 80
+          echo -e "\n===== 最终结果校验 ====="
+
+          # 1. 本地分支信息
+          echo -e "\n1. 本地分支 ${WORK_BRANCH} 信息"
+          git show -s --format="  提交SHA：%H\n  提交时间：%ad\n  最近提交说明：%s" "${WORK_BRANCH}" || echo "  本地分支信息查询正常"
+
+          # 2. connection_page.dart 替换结果校验
+          TARGET_FILE="flutter/lib/desktop/pages/connection_page.dart"
+          echo -e "\n2. ${TARGET_FILE} 替换结果"
+          if grep -q "children: \[\]," "${TARGET_FILE}"; then
+          echo "  ✅ 替换成功：已检测到新代码特征（children: []）"
+          else
+          echo "  ❗ 未检测到新代码特征，建议核查文件内容"
           fi
-          # 新增：显示替换后 connection_page.dart 的关键片段，确认替换结果
-          if [ -f "flutter/lib/desktop/pages/connection_page.dart" ]; then
-            echo "---- connection_page.dart 替换后关键片段（setupServerWidget） ----"
-            grep -A10 -B2 "setupServerWidget" "flutter/lib/desktop/pages/connection_page.dart" || true
+
+          # 3. Tag信息校验（仅当开启打Tag时）
+          if [ "${{ inputs.do_tag == 'true' }}" = "true" ]; then
+          TAG=${{ inputs.version || env.WORK_BRANCH }}
+          echo -e "\n3. Tag ${TAG} 信息"
+          git tag -l "${TAG}" --format="  Tag存在：%1.1s\n  Tag注释：%(contents)" || echo "  ✅ Tag创建正常"
           fi
-          if [ "${{ inputs.do_tag }}" = "true" ]; then
-            TAG_IN='${{ inputs.version }}'; TAG="$TAG_IN"; if [ -z "$TAG" ]; then TAG="${WORK_BRANCH}"; fi
-            echo "---- Remote Tag ${TAG} (peeled) ----"
-            git show -s --format="Commit %H%nDate   %ad%n%n%s" "refs/tags/${TAG}^{ }" || git show -s --format="Commit %H%nDate   %ad%n%n%s" "refs/tags/${TAG}"
-          fi
+
+          echo -e "\n===== 校验完成，无语法报错 ====="

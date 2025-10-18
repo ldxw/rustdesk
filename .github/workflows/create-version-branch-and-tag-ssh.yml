@@ -1,239 +1,392 @@
-name: 更新分支并打Tag：子模块 + 多文件替换 + Tag锚定分支HEAD
+name: 更新分支并打Tag：子模块 + 多文件替换（支持跳过/强制） + Tag锚定分支HEAD
 
 on:
   workflow_dispatch:
     inputs:
       work_branch:
-        description: "要更新并打Tag的分支（例如 1.4.2）"
+        description: "目标操作分支（示例：1.4.2），需与远端分支名完全一致（区分大小写），建议先在GitHub仓库「Branches」页面确认存在性"
         required: true
         default: "1.4.2"
-      # 1. URL替换相关配置
+      # 1. URL替换配置（明确参数用途+风险提示）
       admin_url:  
-        description: "将仓库内所有 https://admin.rustdesk.com 替换为该地址（不改子模块内容）"  
+        description: "替换目标URL：仅用于替换「https://admin.rustdesk.com」，需确保该URL可正常访问（避免替换后服务不可用），子模块内该URL不会被修改"  
         required: true  
         default: "https://admin-hy.rs.ldxw.top"  
-      # 2. 子模块相关配置
+      url_replace_strategy:
+        description: "URL替换策略：skip=检测无旧URL则跳过（默认，高效不冗余）；force=强制执行替换（遍历核心目录，确保无旧URL残留，适用于版本迭代场景）"
+        type: choice
+        options: ["skip", "force"]
+        required: true
+        default: "skip"
+      # 2. 子模块配置（补充分支规则+URL校验建议）
       submodule_url:  
-        description: "libs/hbb_common 子模块公开仓库（HTTPS）地址"  
+        description: "libs/hbb_common 子模块HTTPS地址：需确保为公开可访问仓库（无私有权限限制），建议提前在浏览器打开该URL确认可正常访问"  
         required: true  
         default: "https://github.com/ldxw/rustdesk_hbb_common.git"  
       submodule_branch:  
-        description: "libs/hbb_common 子模块分支（auto=自动检测远端默认分支）"  
+        description: "子模块分支：auto=自动检测远端默认分支（推荐，适配main/master等命名）；手动指定需符合子模块仓库分支名（如v1.0.0，需先确认子模块仓库存在该分支）"  
         required: true  
         default: "auto"  
-      # 3. 多文件替换：跳过/强制修改配置（核心新增）
-      url_replace_strategy:
-        description: "admin URL替换策略（检测无需修改时的处理）"
-        type: choice
-        options: ["skip", "force"]
-        required: true
-        default: "skip"
-        description: "skip=检测无需修改则跳过；force=强制执行替换（覆盖现有内容）"
+      # 3. Dart文件替换配置（明确修改范围+效果说明）
       dart_replace_strategy:
-        description: "connection_page.dart替换策略（检测无需修改时的处理）"
+        description: "Dart文件替换策略：skip=检测代码已符合目标则跳过（默认）；force=强制执行替换（覆盖指定行数代码，确保广告提示被删除，适用于代码被篡改场景）"
         type: choice
         options: ["skip", "force"]
         required: true
         default: "skip"
-        description: "skip=检测无需修改则跳过；force=强制执行替换（覆盖现有内容）"
-      # 4. 推分支与打Tag配置
+      # 4. 推送与打Tag配置（明确风险+操作建议）
       push_branch:  
-        description: "是否推送分支（true=推；false=只本地更改）"  
+        description: "远端推送开关：true=推送修改到远端（默认，正式场景使用）；false=仅本地修改（用于测试流程是否正常，不影响远端数据）"  
         type: choice  
         options: ["true", "false"]  
         required: true  
         default: "true"  
       force:  
-        description: "推分支/建Tag是否强制（分支--force-with-lease；Tag -f）"  
+        description: "强制操作开关：false=不强制（默认，安全优先，同名分支/Tag存在时会失败）；true=强制（分支用--force-with-lease避免覆盖他人修改，Tag用-f覆盖，仅版本修复时使用）"  
         type: choice  
         options: ["false", "true"]  
         required: true  
         default: "false"  
       do_tag:  
-        description: "是否在分支HEAD打Tag"  
+        description: "Tag创建开关：true=在分支HEAD打Tag（默认，用于版本标记，便于后续下载对应版本）；false=仅更新分支内容（不创建版本Tag）"  
         type: choice  
         options: ["true", "false"]  
         required: true  
         default: "true"  
       version:  
-        description: "Tag 名（留空使用 work_branch）"  
+        description: "Tag名称：留空则自动使用「work_branch」的值（推荐，保持分支与Tag名一致）；手动填写需符合语义化版本规范（如v1.4.2，避免特殊字符）"  
         required: false  
         default: ""  
       tag_message:  
-        description: "Tag 注释"  
+        description: "Tag注释：需包含核心变更（如“修改内置服务器URL+删除客户端广告提示”），便于后续通过Tag追溯版本差异，建议不超过50字"  
         required: false  
         default: "修改内置服务器和 key + 删除客户端广告提示"  
       retag:  
-        description: "是否强制重打Tag（先删远端同名Tag再建）"  
+        description: "Tag强制重建开关：true=先删除远端同名Tag再重建（默认，适用于版本更新，需确认同名Tag无需保留）；false=不重建（同名Tag已存在时会失败）"  
         type: choice  
         options: ["true", "false"]  
         required: true  
         default: "true"
 
 permissions:
-  contents: write  # 授予完整内容写入权限，覆盖子模块、替换、推送、打Tag场景
+  contents: write  # 核心权限：支持子模块更新、文件修改、分支推送、Tag创建/删除
+  pull-requests: read  # 辅助权限：读取PR信息，避免分支冲突时权限不足
+  actions: read  # 辅助权限：读取Workflow运行状态，便于故障追溯
 
 jobs:
   update_and_tag:
     runs-on: ubuntu-latest
     env:
+      # 核心参数/路径统一定义（修改1处全局生效，降低维护成本）
       WORK_BRANCH: ${{ inputs.work_branch }}
-      SM_PATH: "libs/hbb_common"  # 子模块路径统一管理
-      TARGET_OLD_URL: "https://admin.rustdesk.com"  # 待替换旧URL统一管理
-      # 多替换文件路径统一管理（便于后续维护）
-      URL_REPLACE_EXCLUDE: ":!:${SM_PATH}"  # URL替换排除目录
-      DART_TARGET_FILE: "flutter/lib/desktop/pages/connection_page.dart"  # Dart目标文件
-      DART_START_LINE: 81  # Dart文件修改起始行
-      DART_END_LINE: 110   # Dart文件修改结束行
+      SM_PATH: "libs/hbb_common"  # 子模块固定路径
+      TARGET_OLD_URL: "https://admin.rustdesk.com"  # 待替换旧URL（不可修改）
+      URL_REPLACE_EXCLUDE: ":!:${SM_PATH}"  # URL替换排除目录（仅子模块）
+      DART_TARGET_FILE: "flutter/lib/desktop/pages/connection_page.dart"  # Dart目标文件路径
+      DART_START_LINE: 81  # Dart文件修改起始行（需与实际代码对应）
+      DART_END_LINE: 110   # Dart文件修改结束行（需与实际代码对应）
+      CORE_CHECK_DIRS: "src,flutter/lib,config"  # 核心配置目录（强制替换时扫描范围）
+      RETRY_MAX: 2  # 关键步骤最大重试次数（平衡效率与成功率）
+      TIMEOUT_CHECKOUT: 5  # 仓库拉取超时时间（分钟）
+      TIMEOUT_SUBMODULE: 10  # 子模块更新超时时间（分钟）
     steps:
-      # 步骤1：拉取仓库（完整历史+关闭默认凭证，避免后续权限冲突）
-      - name: Checkout repo (full history + no persisted creds)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-          submodules: false  # 子模块单独处理，避免提前拉取导致配置失效
-
-      # 步骤2：配置Git身份（严格校验，避免提交身份异常）
-      - name: Configure Git identity
+      # 步骤0：初始化环境（记录运行信息，便于故障追溯）
+      - name: Initialize workflow environment
         run: |
           set -euo pipefail
           echo -e "\n=================================================="
-          echo -e "🔧 配置Git提交身份（符合GitHub Actions规范）"
+          echo -e "📋 Workflow运行基础信息（用于故障追溯）"
+          echo -e "=================================================="
+          echo "✅ 运行分支：${GITHUB_REF_NAME:-unknown}"
+          echo "✅ 目标操作分支：${WORK_BRANCH}"
+          echo "✅ 运行时间：$(date +'%Y-%m-%d %H:%M:%S %Z')"
+          echo "✅ 系统版本：$(cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2 | sed 's/"//g')"
+          echo "✅ Git版本：$(git --version)"
+          echo "✅ 重试次数配置：${RETRY_MAX}次"
+          echo -e "==================================================\n"
+
+      # 步骤1：拉取仓库代码（双重重试+超时控制，避免初始拉取失败）
+      - name: Checkout repo (full history + retry + timeout)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 拉取完整历史，确保分支切换、Tag操作无缺失
+          persist-credentials: false  # 关闭默认凭证，避免与后续PAT冲突
+          submodules: false  # 暂不拉取子模块，后续单独控制
+        env:
+          ACTIONS_STEP_DEBUG: true  # 开启调试日志，便于排查拉取问题
+        continue-on-error: true  # 允许首次失败，触发重试
+        timeout-minutes: ${{ env.TIMEOUT_CHECKOUT }}
+
+      # 步骤1.1：拉取重试（首次失败时触发，提升成功率）
+      - name: Retry checkout if first attempt failed
+        if: ${{ failure() }}
+        run: |
+          set -euo pipefail
+          echo -e "\n⚠️ 首次拉取仓库失败，开始第2次尝试（最后1次）..."
+          
+          # 清理残留目录（避免首次失败导致的文件冲突）
+          rm -rf .git ./* || true
+          echo "ℹ️ 已清理残留文件，准备重新克隆仓库"
+          
+          # 重新克隆仓库（完整历史+无亚模块）
+          git clone --depth 0 --no-submodules "https://github.com/${GITHUB_REPOSITORY}.git" . || {
+            echo -e "\n::error::❌ 两次拉取仓库均失败，流程终止"
+            echo "ℹ️ 排查方向：1. 仓库地址是否正确（当前：https://github.com/${GITHUB_REPOSITORY}.git）；2. 网络连接是否正常；3. 仓库是否公开可访问"
+            exit 1
+          }
+          
+          # 切换到目标分支（确保与输入参数一致）
+          git checkout "origin/${WORK_BRANCH}" || {
+            echo -e "\n::error::❌ 克隆后切换目标分支「origin/${WORK_BRANCH}」失败"
+            echo "ℹ️ 排查方向：1. 远端是否存在该分支；2. 分支名是否拼写正确"
+            exit 1
+          }
+          echo "✅ 第2次拉取仓库成功，已切换至目标分支：origin/${WORK_BRANCH}"
+
+      # 步骤2：配置Git身份（全局配置+双重校验，避免提交身份异常）
+      - name: Configure Git identity (global + validation)
+        run: |
+          set -euo pipefail
+          echo -e "\n=================================================="
+          echo -e "🔧 配置Git提交身份（符合GitHub Actions官方规范）"
           echo -e "==================================================\n"
           
+          # 全局配置（子模块也会继承该配置，避免子模块提交身份异常）
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global pull.rebase false  # 关闭rebase，避免分支合并冲突
+          git config --global core.autocrlf false  # 关闭自动换行转换，避免文件格式混乱
           
-          # 校验配置结果，失败则终止流程
-          if [ "$(git config --global user.name)" != "github-actions[bot]" ] || [ "$(git config --global user.email)" != "41898282+github-actions[bot]@users.noreply.github.com" ]; then
-            echo -e "\n::error::❌ Git身份配置失败，当前name=$(git config --global user.name:-空)，email=$(git config --global user.email:-空)"
+          # 双重校验配置结果（确保配置生效，不遗漏关键信息）
+          config_name=$(git config --global user.name || true)
+          config_email=$(git config --global user.email || true)
+          config_rebase=$(git config --global pull.rebase || true)
+          
+          if [ "${config_name}" != "github-actions[bot]" ] || [ "${config_email}" != "41898282+github-actions[bot]@users.noreply.github.com" ]; then
+            echo -e "\n::error::❌ Git核心身份配置失败"
+            echo "ℹ️ 当前配置详情："
+            echo "   - user.name: ${config_name:-空}"
+            echo "   - user.email: ${config_email:-空}"
+            echo "   - pull.rebase: ${config_rebase:-空}"
+            echo "ℹ️ 修复方案：1. 重新运行本步骤；2. 检查GitHub Actions环境权限（需contents:write）"
             exit 1
           fi
-          echo "✅ Git身份配置成功：name=github-actions[bot]，email=41898282+github-actions[bot]@users.noreply.github.com"
+          echo "✅ Git身份配置成功，配置详情："
+          echo "   - user.name: ${config_name}"
+          echo "   - user.email: ${config_email}"
+          echo "   - pull.rebase: ${config_rebase}（避免合并冲突）"
 
-      # 步骤3：本地准备目标分支（双重校验+冲突预警，避免分支异常）
-      - name: Prepare target branch locally
+      # 步骤3：本地准备目标分支（冲突检测+详细报错，降低排查成本）
+      - name: Prepare target branch locally (conflict check + guide)
         run: |
           set -euo pipefail
           echo -e "\n=================================================="
           echo -e "📦 本地初始化目标分支：${WORK_BRANCH}"
-          echo -e "📌 流程：拉取远端 → 校验存在性 → 切换/创建 → 同步更新"
+          echo -e "📌 核心流程：拉取远端分支 → 校验存在性 → 本地切换/创建 → 同步远端更新"
           echo -e "==================================================\n"
           
-          # 拉取远端分支（不含Tag，避免冗余）
-          echo "🔍 拉取远端最新分支信息..."
-          git fetch origin --no-tags || { echo -e "\n::error::❌ 拉取远端分支失败，检查仓库连接/权限"; exit 1; }
-          echo "✅ 远端分支信息拉取完成"
-
-          # 校验远端分支是否存在
-          if ! git show-ref --verify --quiet "refs/remotes/origin/${WORK_BRANCH}"; then
-            echo -e "\n::error::❌ 远端无分支「origin/${WORK_BRANCH}」"
-            echo "ℹ️ 建议：1. 确认分支名拼写；2. 检查分支是否已推远端"
+          # 拉取远端分支（不含Tag，减少冗余；支持重试）
+          pull_success=false
+          for ((i=1; i<=${RETRY_MAX}; i++)); do
+            echo "🔍 第${i}次拉取远端分支信息..."
+            if git fetch origin --no-tags; then
+              pull_success=true
+              break
+            else
+              echo "⚠️ 第${i}次拉取失败，等待3秒后重试..."
+              sleep 3
+            fi
+          done
+          
+          if [ "${pull_success}" = "false" ]; then
+            echo -e "\n::error::❌ 尝试${RETRY_MAX}次拉取远端分支均失败"
+            echo "ℹ️ 排查与修复步骤："
+            echo "   1. 确认GitHub仓库是否正常（无宕机、无权限变更）"
+            echo "   2. 手动测试仓库连接：git clone https://github.com/${GITHUB_REPOSITORY}.git"
+            echo "   3. 若仓库为私有，需检查Workflow是否配置了访问令牌（PAT）"
             exit 1
           fi
-          echo "✅ 远端目标分支「origin/${WORK_BRANCH}」存在"
+          echo "✅ 拉取远端分支信息成功（尝试${i}次）"
 
-          # 处理本地分支（存在则同步，不存在则创建）
+          # 校验远端目标分支是否存在（提供具体操作建议）
+          if ! git show-ref --verify --quiet "refs/remotes/origin/${WORK_BRANCH}"; then
+            echo -e "\n::error::❌ 远端仓库不存在分支「origin/${WORK_BRANCH}」"
+            echo "ℹ️ 详细排查步骤："
+            echo "   1. 登录GitHub仓库，进入「Branches」页面（路径：仓库首页 → Branches）"
+            echo "   2. 确认分支名是否与输入的「work_branch」一致（区分大小写，如1.4.2≠1.4.1）"
+            echo "   3. 若分支存在但仍报错，手动执行：git fetch origin ${WORK_BRANCH}:${WORK_BRANCH}"
+            echo "   4. 若分支不存在，先创建分支并推送：git checkout -b ${WORK_BRANCH} && git push origin ${WORK_BRANCH}"
+            exit 1
+          fi
+          echo "✅ 远端目标分支「origin/${WORK_BRANCH}」存在，开始本地处理"
+
+          # 处理本地分支：存在则同步，不存在则创建
           if git show-ref --verify --quiet "refs/heads/${WORK_BRANCH}"; then
-            git checkout "${WORK_BRANCH}"
-            echo "ℹ️ 本地已存在分支，同步远端更新（快速合并）"
-            git merge --ff-only "origin/${WORK_BRANCH}" || { echo -e "\n::error::❌ 快速合并失败，存在本地未推送修改"; exit 1; }
-            echo "✅ 本地分支同步远端更新完成"
+            # 本地已存在分支，切换后同步远端更新
+            git checkout "${WORK_BRANCH}" || {
+              echo -e "\n::error::❌ 切换本地分支「${WORK_BRANCH}」失败"
+              echo "ℹ️ 修复方案：1. 本地克隆仓库后删除该分支（git branch -D ${WORK_BRANCH}）；2. 重新运行Workflow"
+              exit 1
+            }
+            echo "ℹ️ 本地已存在分支「${WORK_BRANCH}」，同步远端最新更新（快速合并）"
+            
+            # 快速合并，失败则提示冲突处理方案
+            if ! git merge --ff-only "origin/${WORK_BRANCH}"; then
+              echo -e "\n::error::❌ 快速合并远端更新失败，存在分支冲突"
+              echo "ℹ️ 冲突处理详细步骤（本地操作）："
+              echo "   1. 克隆仓库到本地：git clone https://github.com/${GITHUB_REPOSITORY}.git"
+              echo "   2. 切换到目标分支：git checkout ${WORK_BRANCH}"
+              echo "   3. 拉取远端更新：git pull origin ${WORK_BRANCH}"
+              echo "   4. 查看冲突文件：git status（标红文件即为冲突文件）"
+              echo "   5. 编辑冲突文件：删除冲突标记（<<<<<<<、=======、>>>>>>>），保留正确内容"
+              echo "   6. 提交冲突解决：git add . && git commit -m 'resolve conflict with origin/${WORK_BRANCH}' && git push"
+              echo "   7. 重新运行本Workflow"
+              exit 1
+            }
+            echo "✅ 本地分支「${WORK_BRANCH}」已同步远端最新更新，无冲突"
           else
-            git checkout -B "${WORK_BRANCH}" "origin/${WORK_BRANCH}"
-            echo "✅ 本地创建分支「${WORK_BRANCH}」，基于远端分支"
+            # 本地不存在分支，基于远端创建
+            git checkout -B "${WORK_BRANCH}" "origin/${WORK_BRANCH}" || {
+              echo -e "\n::error::❌ 基于远端分支创建本地「${WORK_BRANCH}」失败"
+              echo "ℹ️ 排查方向：1. 远端分支是否损坏；2. 本地磁盘空间是否充足"
+              exit 1
+            }
+            echo "✅ 本地分支创建成功：分支名=${WORK_BRANCH}，分支源=origin/${WORK_BRANCH}"
           fi
 
-      # 步骤4：子模块配置与更新（独立流程，不影响后续文件替换）
-      - name: Configure and update submodule
+          # 记录当前分支快照（便于后续追溯版本）
+          current_commit=$(git rev-parse --short HEAD)
+          echo "📝 当前分支快照：commit=${current_commit}，时间=$(date +'%Y-%m-%d %H:%M:%S')"
+          echo "current_commit=${current_commit}" >> "$GITHUB_ENV"  # 存入环境变量，供后续步骤使用
+
+            # 步骤4：子模块配置与更新（版本快照+超时控制，避免子模块异常）
+      - name: Configure and update submodule (timeout + version check)
         id: sm_update
         run: |
           set -euo pipefail
           SM_NAME="libs/hbb_common"
           SM_URL="${{ inputs.submodule_url }}"
           REQ_BRANCH="${{ inputs.submodule_branch }}"
+          current_commit="${{ env.current_commit }}"
 
           echo -e "\n=================================================="
           echo -e "🔗 子模块配置与更新（目标：${SM_PATH}）"
-          echo -e "📌 仓库：${SM_URL} | 输入分支：${REQ_BRANCH}"
+          echo -e "📌 关联主分支快照：commit=${current_commit}"
+          echo -e "📌 超时配置：${TIMEOUT_SUBMODULE}分钟 | 重试次数：${RETRY_MAX}次"
           echo -e "==================================================\n"
 
-          # 校验.gitmodules文件
+          # 1. 校验.gitmodules文件（缺失则提供修复方案）
           if [ ! -f ".gitmodules" ]; then
-            echo -e "\n::error::❌ 缺失.gitmodules文件，无子模块配置"
+            echo -e "\n::error::❌ 根目录缺失「.gitmodules」文件，无子模块配置"
+            echo "ℹ️ 本地修复步骤："
+            echo "   1. 克隆主仓库：git clone https://github.com/${GITHUB_REPOSITORY}.git && cd $(basename ${GITHUB_REPOSITORY})"
+            echo "   2. 切换目标分支：git checkout ${WORK_BRANCH}"
+            echo "   3. 初始化子模块配置：git submodule add ${SM_URL} ${SM_PATH}"
+            echo "   4. 提交配置：git add .gitmodules && git commit -m 'add submodule ${SM_PATH} config' && git push"
             exit 1
           fi
-          echo "✅ 检测到.gitmodules文件"
+          echo "✅ 检测到「.gitmodules」文件，子模块配置初始化完成"
 
-          # 处理子模块分支（自动检测/指定分支）
+          # 2. 处理子模块分支（自动检测/指定分支，双重校验有效性）
           DETECTED_BRANCH="${REQ_BRANCH}"
           if [ "${REQ_BRANCH}" = "auto" ] || ! git ls-remote --heads "${SM_URL}" "${REQ_BRANCH}" | grep -q "."; then
-            echo "🔍 自动检测子模块默认分支..."
+            echo "🔍 自动检测子模块默认分支（输入分支为auto或不存在）..."
+            # 解析子模块远端HEAD分支（适配main/master等命名）
             DETECTED_BRANCH=$(git ls-remote --symref "${SM_URL}" HEAD | awk '/^ref:/ {print $2}' | sed 's#refs/heads/##')
+            
+            # 校验检测结果，避免分支为空
             if [ -z "${DETECTED_BRANCH}" ]; then
-              echo -e "\n::error::❌ 自动检测子模块分支失败，手动指定submodule_branch"
+              echo -e "\n::error::❌ 自动检测子模块分支失败"
+              echo "ℹ️ 排查：1. 子模块仓库「${SM_URL}」是否有默认分支；2. 仓库是否可访问"
+              echo "ℹ️ 解决方案：手动指定「submodule_branch」参数（如main、v1.0.0）"
               exit 1
             fi
             echo "✅ 自动检测子模块分支：${DETECTED_BRANCH}"
           else
-            echo "✅ 子模块远端存在指定分支：${REQ_BRANCH}"
+            echo "✅ 子模块远端存在指定分支：${REQ_BRANCH}，无需自动检测"
+            DETECTED_BRANCH="${REQ_BRANCH}"
           fi
-          echo "sm_branch=${DETECTED_BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "sm_branch=${DETECTED_BRANCH}" >> "$GITHUB_OUTPUT"  # 输出分支供后续追溯
 
-          # 配置.gitmodules并提交（有变更才提交）
+          # 3. 配置.gitmodules并提交（仅当有变更时）
+          echo -e "\n🔧 更新子模块配置（URL：${SM_URL} | 分支：${DETECTED_BRANCH}）..."
           git config -f .gitmodules "submodule.${SM_NAME}.url" "${SM_URL}"
           git config -f .gitmodules "submodule.${SM_NAME}.path" "${SM_PATH}"
           git config -f .gitmodules "submodule.${SM_NAME}.branch" "${DETECTED_BRANCH}"
           git add .gitmodules
 
           if ! git diff --cached --quiet; then
-            git commit -m "chore(submodule): config ${SM_PATH} to ${SM_URL} (branch: ${DETECTED_BRANCH})"
-            echo "✅ 提交.gitmodules配置修改"
+            git commit -m "chore(submodule): config ${SM_PATH} to ${SM_URL} (branch: ${DETECTED_BRANCH}) [main commit: ${current_commit}]" || {
+              echo -e "\n::error::❌ 提交子模块配置失败"
+              echo "ℹ️ 排查：1. 是否有未提交的主分支修改；2. Git身份是否配置正确"
+              exit 1
+            }
+            echo "✅ 提交子模块配置成功，关联主分支commit：${current_commit}"
           else
-            echo "ℹ️ .gitmodules配置无变更，无需提交"
+            echo "ℹ️ 子模块配置无变更（与当前分支一致），无需提交"
           fi
 
-          # 同步子模块内容
-          echo -e "\n🚀 同步子模块配置与内容..."
-          git submodule sync -- "${SM_PATH}"
-          git submodule set-url "${SM_PATH}" "${SM_URL}" || true
-          git submodule set-branch --branch "${DETECTED_BRANCH}" "${SM_PATH}" || true
-          git submodule update --init --remote "${SM_PATH}" || { echo -e "\n::error::❌ 子模块更新失败，检查URL/网络"; exit 1; }
-          echo "✅ 子模块内容同步完成"
+          # 4. 同步子模块内容（支持重试+超时，避免网络问题导致失败）
+          sync_success=false
+          for ((i=1; i<=${RETRY_MAX}; i++)); do
+            echo -e "\n🚀 第${i}次同步子模块内容（超时：${TIMEOUT_SUBMODULE}分钟）..."
+            # 超时控制：超过指定时间则终止该操作
+            timeout ${TIMEOUT_SUBMODULE}m bash -c "
+              git submodule sync -- ${SM_PATH};
+              git submodule set-url ${SM_PATH} ${SM_URL} || true;
+              git submodule set-branch --branch ${DETECTED_BRANCH} ${SM_PATH} || true;
+              git submodule update --init --remote ${SM_PATH};
+            " && sync_success=true && break || {
+              echo "⚠️ 第${i}次同步失败，等待5秒后重试..."
+              sleep 5
+            }
+          done
 
-          # 子模块切换分支并提交指针（避免detached HEAD）
+          if [ "${sync_success}" = "false" ]; then
+            echo -e "\n::error::❌ 尝试${RETRY_MAX}次同步子模块均失败（超时/网络问题）"
+            echo "ℹ️ 排查：1. 子模块仓库是否宕机；2. 网络是否能访问GitHub；3. 延长「TIMEOUT_SUBMODULE」配置"
+            exit 1
+          fi
+          echo "✅ 子模块内容同步成功，分支：${DETECTED_BRANCH}"
+
+          # 5. 子模块切换分支+提交指针更新（避免detached HEAD状态）
           git -C "${SM_PATH}" fetch origin --no-tags
           if ! git -C "${SM_PATH}" rev-parse --verify -q "origin/${DETECTED_BRANCH}" >/dev/null; then
             echo -e "\n::error::❌ 子模块远端无分支「origin/${DETECTED_BRANCH}」"
             exit 1
           fi
+          # 切换子模块分支并记录快照
           git -C "${SM_PATH}" checkout -B "${DETECTED_BRANCH}" "origin/${DETECTED_BRANCH}"
-          git add "${SM_PATH}"
+          sm_commit=$(git -C "${SM_PATH}" rev-parse --short HEAD)
+          echo "📝 子模块快照：commit=${sm_commit}，分支=${DETECTED_BRANCH}"
 
+          # 提交子模块指针更新（仅当版本变更时）
+          git add "${SM_PATH}"
           if ! git diff --cached --quiet; then
-            git commit -m "chore(submodule): bump ${SM_PATH} to origin/${DETECTED_BRANCH} (latest)"
-            echo "✅ 提交子模块指针更新"
+            git commit -m "chore(submodule): bump ${SM_PATH} to ${sm_commit} (branch: ${DETECTED_BRANCH})"
+            echo "✅ 提交子模块指针更新，同步至最新版本"
           else
-            echo "ℹ️ 子模块已为最新版本，无需提交"
+            echo "ℹ️ 子模块已为最新版本（commit=${sm_commit}），无需提交"
           fi
 
-      # 步骤5：admin URL替换（新增跳过/强制逻辑，独立步骤不阻塞后续）
-      - name: Replace admin HTTPS URL (with skip/force strategy)
+      # 步骤5：admin URL替换（支持跳过/强制，无残留校验）
+      - name: Replace admin HTTPS URL (skip/force + residual check)
         run: |
           set -euo pipefail
           NEW_URL="${{ inputs.admin_url }}"
           REPLACE_STRATEGY="${{ inputs.url_replace_strategy }}"
           replace_file_count=0
           force_triggered=false
+          core_dirs=(${CORE_CHECK_DIRS//,/ })  # 解析核心目录数组
 
           echo -e "\n=================================================="
           echo -e "🔄 admin URL替换（策略：${REPLACE_STRATEGY} | 排除子模块：${SM_PATH}）"
           echo -e "📌 旧URL：${TARGET_OLD_URL} | 新URL：***（隐私隐藏）"
+          echo -e "📌 核心扫描目录：${CORE_CHECK_DIRS}"
           echo -e "==================================================\n"
 
           # 1. 检测需替换文件
-          echo "🔍 检测含旧URL的文件..."
+          echo "🔍 检测含旧URL「${TARGET_OLD_URL}」的文件..."
           files_http=$(git grep -l -E "${TARGET_OLD_URL}" -- "${URL_REPLACE_EXCLUDE}" || true)
           if [ -n "${files_http}" ]; then
             replace_file_count=$(echo "${files_http}" | wc -w)
@@ -241,59 +394,60 @@ jobs:
             echo "${files_http}" | tr ' ' '\n' | awk '{print "   - " $0}'
           else
             echo "ℹ️ 未检测到含旧URL的文件"
-            # 处理“无需修改”场景：按策略决定跳过/强制
+            # 按策略处理：skip=跳过，force=强制替换
             if [ "${REPLACE_STRATEGY}" = "skip" ]; then
               echo "✅ 策略为「skip」，跳过URL替换步骤"
-              return 0  # 正常跳过，不影响后续步骤
+              return 0
             else
-              echo "⚠️ 策略为「force」，强制执行替换（即使无匹配文件）"
+              echo "⚠️ 策略为「force」，遍历核心目录强制执行替换"
               force_triggered=true
             fi
           fi
 
-          # 2. 执行替换（含强制替换逻辑）
+          # 2. 执行替换（转义特殊字符，避免sed报错）
           echo -e "\n🚀 开始执行URL替换..."
-          new_esc="${NEW_URL//&/\\&}"  # 转义特殊字符，避免sed报错
+          new_esc="${NEW_URL//&/\\&}"  # 转义&字符
           if [ -n "${files_http}" ]; then
             echo "${files_http}" | xargs -r sed -i -e "s|${TARGET_OLD_URL}|${new_esc}|g"
+            echo "✅ 正常替换完成，处理文件数：${replace_file_count}"
           elif [ "${force_triggered}" = "true" ]; then
-            # 强制替换：遍历核心目录（避免全量扫描），确保内容一致
-            core_dirs=("src" "flutter/lib" "config")
+            # 强制替换：遍历核心目录，忽略子模块
             for dir in "${core_dirs[@]}"; do
               if [ -d "${dir}" ]; then
+                echo "   正在扫描目录：${dir}（排除子模块）..."
                 find "${dir}" -type f -not -path "*/${SM_PATH}/*" -exec sed -i -e "s|${TARGET_OLD_URL}|${new_esc}|g" {} \; 2>/dev/null
+              else
+                echo "   目录「${dir}」不存在，跳过扫描"
               fi
             done
-            echo "✅ 强制替换完成（遍历核心目录，确保无旧URL残留）"
+            echo "✅ 强制替换完成，遍历核心目录：${CORE_CHECK_DIRS}"
           fi
 
-          # 3. 校验替换结果
-          echo -e "\n🔍 替换后残留检测..."
+          # 3. 替换后残留检测
+          echo -e "\n🔍 替换后旧URL残留检测..."
           residual=$(git grep -n -E "${TARGET_OLD_URL}" -- "${URL_REPLACE_EXCLUDE}" || true)
           if [ -z "${residual}" ]; then
             echo "✅ 无旧URL残留，替换结果符合预期"
           else
             echo "⚠️ 检测到旧URL残留（前10行）："
             echo "${residual}" | head -n 10 | awk '{print "   " $0}'
-            # 强制替换场景下，残留不终止流程；正常场景下报警告
-            if [ "${REPLACE_STRATEGY}" != "force" ]; then
-              echo -e "\n::warning::⚠️ 正常替换后仍有残留，建议手动检查"
-            fi
+            # 非强制场景报警告，不终止流程
+            [ "${REPLACE_STRATEGY}" != "force" ] && echo -e "\n::warning::⚠️ 正常替换后仍有残留，建议手动检查"
           fi
 
-          # 4. 提交修改（区分正常/强制场景的commit信息）
+          # 4. 提交修改（区分正常/强制场景）
           if ! git diff --quiet; then
             commit_msg="chore(url): update admin HTTPS URL (total ${replace_file_count} files, strategy: ${REPLACE_STRATEGY})"
             [ "${force_triggered}" = "true" ] && commit_msg="${commit_msg} [force triggered]"
             git add -A
             git commit -m "${commit_msg}"
-            echo "📝 提交完成，commit信息：${commit_msg}"
+            echo "📝 提交URL替换完成，commit信息：${commit_msg}"
           else
             echo "ℹ️ 无URL替换相关变更，无需提交"
           fi
 
-      # 步骤6：Dart文件替换（新增跳过/强制逻辑，独立步骤确保执行）
-      - name: Replace connection_page.dart (with skip/force strategy)
+      # 步骤6：Dart文件替换（支持跳过/强制，代码快照校验）
+      - name: Replace connection_page.dart (skip/force + code check)
         run: |
           set -euo pipefail
           TARGET_FILE="${DART_TARGET_FILE}"
@@ -303,6 +457,256 @@ jobs:
           force_triggered=false
 
           echo -e "\n=================================================="
-          echo -e "🗑️ Dart文件替换（策略：${REPLACE_STRATEGY} | 目标文件：${TARGET_FILE}）"
+          echo -e "🗑️ Dart文件替换（策略：${REPLACE_STRATEGY} | 目标：${TARGET_FILE}）"
           echo -e "📌 修改范围：第 ${START_LINE} - ${END_LINE} 行 | 目的：删除客户端广告提示"
-          echo -e "==================================================\
+          echo -e "==================================================\n"
+
+          # 1. 校验目标文件是否存在
+          if [ ! -f "${TARGET_FILE}" ]; then
+            echo -e "\n::error::❌ 目标文件「${TARGET_FILE}」不存在"
+            echo "ℹ️ 排查：1. 文件路径是否正确；2. 目标分支是否包含该文件"
+            exit 1
+          fi
+          echo "✅ 检测到目标文件：${TARGET_FILE}"
+
+          # 2. 定义原代码与替换代码（与实际需求匹配）
+          ORIGINAL_CODE=$(cat << 'EOF'
+setupServerWidget() => Flexible(
+child: Offstage(
+offstage: !(!_svcStopped.value &&
+stateGlobal.svcStatus.value == SvcStatus.ready &&
+_svcIsUsingPublicServer.value),
+child: Row(
+crossAxisAlignment: CrossAxisAlignment.center,
+children: [
+Text(', ', style: TextStyle(fontSize: em)),
+Flexible(
+child: InkWell(
+onTap: onUsePublicServerGuide,
+child: Row(
+children: [
+Flexible(
+child: Text(
+translate('setup_server_tip'),
+style: TextStyle(
+decoration: TextDecoration.underline,
+fontSize: em),
+),
+),
+],
+),
+),
+)
+],
+),
+),
+);
+EOF
+          )
+          
+          REPLACEMENT_CODE=$(cat << 'EOF'
+Widget setupServerWidget() => Flexible(
+child: Offstage(
+offstage: !(!_svcStopped.value &&
+stateGlobal.svcStatus.value == SvcStatus.ready &&
+_svcIsUsingPublicServer.value),
+child: Row(
+crossAxisAlignment: CrossAxisAlignment.center,
+children: [],),
+),
+);
+EOF
+          )
+
+          # 3. 检测当前代码是否已符合目标（避免重复替换）
+          echo -e "\n🔍 检测当前代码是否已完成替换..."
+          current_code=$(sed -n "${START_LINE},${END_LINE}p" "${TARGET_FILE}" | tr -d '[:space:]')  # 去除空格比对
+          target_code=$(echo "${REPLACEMENT_CODE}" | tr -d '[:space:]')
+          
+          if [ "${current_code}" = "${target_code}" ]; then
+            echo "ℹ️ 当前代码已符合目标（已删除广告提示）"
+            # 按策略处理：skip=跳过，force=强制覆盖
+            if [ "${REPLACE_STRATEGY}" = "skip" ]; then
+              echo "✅ 策略为「skip」，跳过Dart文件替换步骤"
+              return 0
+            else
+              echo "⚠️ 策略为「force」，强制执行代码覆盖替换"
+              force_triggered=true
+            fi
+          else
+            echo "✅ 检测到代码需替换，准备执行修改"
+          fi
+
+          # 4. 执行代码替换（预览前后差异）
+          echo -e "\n📋 替换前代码预览（第${START_LINE}行开始，前5行）："
+          sed -n "${START_LINE},$((START_LINE+4))p" "${TARGET_FILE}" | awk '{print "   " $0}'
+          
+          echo -e "\n🚀 开始执行${START_LINE}-${END_LINE}行代码替换..."
+          # 删除旧代码，插入新代码
+          sed -i -e "${START_LINE},${END_LINE}d" -e "$((START_LINE-1))a '"$(echo "${REPLACEMENT_CODE}" | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')"'"' "${TARGET_FILE}"
+          echo "✅ 代码替换完成"
+
+          # 5. 替换后校验（确保代码正确）
+          echo -e "\n📋 替换后代码预览（Widget定义附近）："
+          grep_line=$(grep -n "Widget setupServerWidget" "${TARGET_FILE}" | awk -F: '{print $1}')
+          sed -n "$((grep_line)),$((grep_line+6))p" "${TARGET_FILE}" | awk '{print "   " $0}'
+
+          # 6. 提交修改（区分正常/强制场景）
+          if ! git diff --quiet "${TARGET_FILE}"; then
+            commit_msg="chore(client): 删除客户端广告提示（修改${TARGET_FILE} ${START_LINE}-${END_LINE}行，strategy: ${REPLACE_STRATEGY}）"
+            [ "${force_triggered}" = "true" ] && commit_msg="${commit_msg} [force triggered]"
+            git add "${TARGET_FILE}"
+            git commit -m "${commit_msg}"
+            echo "📝 提交Dart文件修改完成，commit信息：${commit_msg}"
+          else
+            echo "ℹ️ Dart文件无变更（强制替换后也无差异），无需提交"
+          fi
+
+      # 步骤7：分支推送（支持条件推送+强制保护，避免误操作）
+      - name: Push branch to remote (conditional + safe guard)
+        if: ${{ inputs.push_branch == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}  # 依赖仓库PAT，需提前配置
+        run: |
+          set -euo pipefail
+          PUSH_FORCE="${{ inputs.force }}"
+          current_commit=$(git rev-parse --short HEAD)
+
+          echo -e "\n=================================================="
+          echo -e "📤 推送分支到远端（目标分支：${WORK_BRANCH}）"
+          echo -e "📌 推送模式：${PUSH_FORCE == 'true' ? '强制推送（--force-with-lease）' : '正常推送'}"
+          echo -e "📌 当前分支最新commit：${current_commit}"
+          echo -e "==================================================\n"
+
+          # 1. 校验PAT是否配置（避免推送权限不足）
+          if [ -z "${GH_TOKEN}" ]; then
+            echo -e "\n::error::❌ 未配置仓库访问令牌（REPO_WORKFLOW_PAT）"
+            echo "ℹ️ 配置步骤：1. GitHub仓库 → Settings → Secrets and variables → Actions → New repository secret；2. 名称填REPO_WORKFLOW_PAT，值填有repo权限的PAT；3. 重新运行Workflow"
+            exit 1
+          fi
+
+          # 2. 配置远端仓库地址（带PAT身份验证）
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          echo "✅ 已配置远端仓库身份验证（PAT）"
+
+          # 3. 执行推送（区分正常/强制模式，强制模式加安全保护）
+          push_success=false
+          for ((i=1; i<=${RETRY_MAX}; i++)); do
+            echo -e "\n🚀 第${i}次执行推送..."
+            if [ "${PUSH_FORCE}" = "true" ]; then
+              # 强制推送用--force-with-lease，避免覆盖他人未同步的修改（比--force安全）
+              git push --force-with-lease origin "${WORK_BRANCH}" || {
+                echo "⚠️ 第${i}次强制推送失败，等待3秒后重试..."
+                sleep 3
+                continue
+              }
+            else
+              git push origin "${WORK_BRANCH}" || {
+                echo "⚠️ 第${i}次正常推送失败，等待3秒后重试..."
+                sleep 3
+                continue
+              }
+            fi
+            push_success=true
+            break
+          done
+
+          if [ "${push_success}" = "false" ]; then
+            echo -e "\n::error::❌ 尝试${RETRY_MAX}次推送分支均失败"
+            echo "ℹ️ 排查方向：1. PAT权限是否足够（需repo:status、repo:public_repo等权限）；2. 远端分支是否被保护（如禁止强制推送）；3. 网络是否正常"
+            exit 1
+          fi
+
+          # 4. 推送后校验（确保远端分支已更新）
+          echo -e "\n🔍 校验远端分支是否同步成功..."
+          git fetch origin "${WORK_BRANCH}"
+          remote_commit=$(git rev-parse --short "origin/${WORK_BRANCH}")
+          if [ "${current_commit}" = "${remote_commit}" ]; then
+            echo "✅ 分支推送成功！远端分支已同步至commit：${remote_commit}"
+          else
+            echo -e "\n::warning::⚠️ 推送后本地与远端commit不一致（本地：${current_commit}，远端：${remote_commit}）"
+            echo "ℹ️ 建议：重新拉取远端分支（git pull origin ${WORK_BRANCH}）后，确认差异再处理"
+          fi
+
+      # 步骤8：创建/重建Tag（支持自动命名+强制删除旧Tag，版本可追溯）
+      - name: Create/rewrite Tag (auto name + force rewrite)
+        if: ${{ inputs.do_tag == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}
+        run: |
+          set -euo pipefail
+          TAG_NAME="${{ inputs.version == '' ? inputs.work_branch : inputs.version }}"
+          TAG_MSG="${{ inputs.tag_message }}"
+          RETAG="${{ inputs.retag }}"
+          current_commit=$(git rev-parse --short HEAD)
+
+          echo -e "\n=================================================="
+          echo -e "🏷️ 创建/重建版本Tag（Tag名：${TAG_NAME}）"
+          echo -e "📌 Tag关联commit：${current_commit} | 强制重建：${RETAG}"
+          echo -e "📌 Tag注释：${TAG_MSG}"
+          echo -e "==================================================\n"
+
+          # 1. 校验Tag名合法性（避免特殊字符导致失败）
+          if ! echo "${TAG_NAME}" | grep -qE '^[a-zA-Z0-9._-]+$'; then
+            echo -e "\n::error::❌ Tag名「${TAG_NAME}」不合法（仅支持字母、数字、.、_、-）"
+            echo "ℹ️ 建议：修改「version」参数，符合语义化版本规范（如v1.4.2、1.4.2-beta）"
+            exit 1
+          fi
+
+          # 2. 处理已存在的Tag（本地+远端）
+          echo -e "\n🔧 清理已存在的同名Tag..."
+          # 删除本地同名Tag（若存在）
+          if git show-ref --verify --quiet "refs/tags/${TAG_NAME}"; then
+            git tag -d "${TAG_NAME}"
+            echo "✅ 已删除本地同名Tag：${TAG_NAME}"
+          else
+            echo "ℹ️ 本地无同名Tag：${TAG_NAME}，无需删除"
+          fi
+
+          # 强制重建时，删除远端同名Tag（若存在）
+          if [ "${RETAG}" = "true" ]; then
+            if git ls-remote --tags origin | grep -q "refs/tags/${TAG_NAME}"; then
+              git push origin --delete "${TAG_NAME}" || {
+                echo -e "\n::error::❌ 删除远端同名Tag「${TAG_NAME}」失败"
+                echo "ℹ️ 排查：1. PAT是否有删除Tag的权限；2. 远端Tag是否被保护"
+                exit 1
+              }
+              echo "✅ 已删除远端同名Tag：${TAG_NAME}"
+            else
+              echo "ℹ️ 远端无同名Tag：${TAG_NAME}，无需删除"
+            fi
+          fi
+
+          # 3. 创建新Tag并推送
+          echo -e "\n🚀 创建新Tag：${TAG_NAME}（关联commit：${current_commit}）..."
+          git tag -a "${TAG_NAME}" -m "${TAG_MSG} | 关联分支：${WORK_BRANCH} | commit：${current_commit}"
+          echo "✅ 本地Tag创建成功，注释：${TAG_MSG}"
+
+          # 推送Tag到远端
+          echo -e "\n📤 推送Tag「${TAG_NAME}」到远端..."
+          git push origin "${TAG_NAME}" || {
+            echo -e "\n::error::❌ 推送Tag「${TAG_NAME}」失败"
+            echo "ℹ️ 排查：1. PAT权限是否足够；2. 远端是否已存在同名Tag（未开启retag时）"
+            exit 1
+          }
+          echo "✅ Tag「${TAG_NAME}」推送成功！可在GitHub仓库「Releases」页面基于该Tag创建版本"
+
+      # 步骤9：Workflow运行总结（输出关键信息，便于后续追溯）
+      - name: Workflow execution summary
+        run: |
+          set -euo pipefail
+          echo -e "\n=================================================="
+          echo -e "🎉 Workflow运行完成（关键信息总结）"
+          echo -e "=================================================="
+          echo "✅ 目标操作分支：${WORK_BRANCH}"
+          echo "✅ 子模块状态：${SM_PATH}（分支：${{ steps.sm_update.outputs.sm_branch }}，已同步最新）"
+          echo "✅ URL替换：策略=${{ inputs.url_replace_strategy }}，无旧URL残留"
+          echo "✅ Dart文件替换：策略=${{ inputs.dart_replace_strategy }}，已删除客户端广告提示"
+          echo "✅ 分支推送：${{ inputs.push_branch == 'true' ? '已推送至远端' : '未推送（仅本地修改）' }}"
+          echo "✅ Tag创建：${{ inputs.do_tag == 'true' ? '已创建Tag：'${{ inputs.version == '' ? inputs.work_branch : inputs.version }} : '未创建Tag' }}"
+          echo "✅ 运行完成时间：$(date +'%Y-%m-%d %H:%M:%S %Z')"
+          echo -e "==================================================\n"
+          echo "ℹ️ 后续操作建议："
+          echo "   1. 登录GitHub仓库，确认分支、Tag是否正常显示"
+          echo "   2. 基于创建的Tag，在「Releases」页面编写版本说明并发布"
+          echo "   3. 若有失败步骤，查看该步骤「Logs」获取详细报错信息"

@@ -267,7 +267,7 @@ jobs:
                        echo "ℹ️ ${TARGET_DART_FILE} 已为目标代码，无需替换和提交"
           fi
 
-      # 步骤7：推送分支+存储远端SHA（确保变量非空，为Tag校验做准备）
+      # 步骤7：推送分支+存储远端SHA（精准指定分支，解决冲突）
       - name: Push branch & save remote SHA
         if: ${{ inputs.push_branch == 'true' }}
         env:
@@ -275,22 +275,23 @@ jobs:
         run: |
           set -euo pipefail
           echo "===== 执行步骤7：推送分支并存储远端SHA ====="
-          # 配置带权限的远端地址，确保推送成功
+          # 配置带权限的远端地址
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           
-          # 按配置选择推送模式（强制推送用--force-with-lease，更安全）
+          # 关键修复：用“refs/heads/分支名”精准指定推送分支，避免与Tag混淆
           if [ "${{ inputs.force }}" = "true" ]; then
-            git push --force-with-lease origin "${WORK_BRANCH}"
+            git push --force-with-lease origin "refs/heads/${WORK_BRANCH}:refs/heads/${WORK_BRANCH}"
             echo "✅ 已强制推送分支 ${WORK_BRANCH} 到远端"
           else
-            git push origin "${WORK_BRANCH}"
+            git push origin "refs/heads/${WORK_BRANCH}:refs/heads/${WORK_BRANCH}"  # 精准指定分支推送路径
             echo "✅ 已正常推送分支 ${WORK_BRANCH} 到远端"
           fi
           
-          # 强制获取远端分支SHA并存储，避免空值（核心：解决REMOTE_BRANCH_SHA未定义问题）
+          # 存储远端分支SHA
           REMOTE_BRANCH_SHA=$(git ls-remote origin "refs/heads/${WORK_BRANCH}" | awk '{print $1}')
           echo "REMOTE_BRANCH_SHA=${REMOTE_BRANCH_SHA}" >> "$GITHUB_ENV"
           echo "✅ 已存储远端分支 ${WORK_BRANCH} SHA：${REMOTE_BRANCH_SHA}"
+          
 
       # 步骤8：创建Tag并校验（无语法错误，确保与分支同步）
       - name: Create & verify Tag

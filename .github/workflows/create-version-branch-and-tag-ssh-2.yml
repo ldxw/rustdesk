@@ -1,4 +1,4 @@
-name: 更新分支并打Tag：子模块 + URL替换 + Tag锚定分支HEAD
+name: 保留 更新分支并打Tag：子模块 + URL替换 + Tag锚定分支HEAD
 
 on:
   workflow_dispatch:
@@ -275,7 +275,7 @@ jobs:
           echo "REMOTE_BRANCH_SHA=${REMOTE_BRANCH_SHA}" >> "$GITHUB_ENV"
           echo "✅ 已存储远端分支SHA：${REMOTE_BRANCH_SHA}"
 
-            # 步骤8：创建&校验Tag（直接用远端分支SHA，100%避免不一致）
+      # 步骤8：创建&校验Tag（直接用远端分支SHA，100%避免不一致）
       - name: Create & verify Tag (use remote SHA directly)
         if: ${{ inputs.do_tag == 'true' }}
         env:

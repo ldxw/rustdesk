@@ -410,8 +410,7 @@ jobs:
           echo "✅ 检测到目标文件：${TARGET_FILE}"
 
           # 2. 定义原代码与替换代码（与实际需求匹配）
-          ORIGINAL_CODE=$(cat << 'EOF'
-setupServerWidget() => Flexible(
+          ORIGINAL_CODE="setupServerWidget() => Flexible(
 child: Offstage(
 offstage: !(!_svcStopped.value &&
 stateGlobal.svcStatus.value == SvcStatus.ready &&
@@ -441,12 +440,9 @@ fontSize: em),
 ],
 ),
 ),
-);
-EOF
-          )
+);"
           
-          REPLACEMENT_CODE=$(cat << 'EOF'
-Widget setupServerWidget() => Flexible(
+          REPLACEMENT_CODE="Widget setupServerWidget() => Flexible(
 child: Offstage(
 offstage: !(!_svcStopped.value &&
 stateGlobal.svcStatus.value == SvcStatus.ready &&
@@ -455,9 +451,7 @@ child: Row(
 crossAxisAlignment: CrossAxisAlignment.center,
 children: [],),
 ),
-);
-EOF
-          )
+);"
 
           # 3. 检测当前代码是否已符合目标（去除空格比对，避免格式干扰）
           echo -e "\n🔍 检测当前代码是否已完成替换..."

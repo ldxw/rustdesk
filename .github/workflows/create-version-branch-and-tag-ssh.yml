@@ -6,7 +6,7 @@ on:
       work_branch:
         description: "要更新并打Tag的分支（例如 1.4.2）"
         required: true
-        default: "1.4.4"
+        default: "1.4.2"
 
       # 仅替换 https://admin.rustdesk.com
       admin_url:
@@ -24,7 +24,7 @@ on:
         required: true
         default: "auto"
 
-      # 推分支与打Tag选项（≤10个）
+      # 推分支与打Tag选项
       push_branch:
         description: "是否推送分支（true=推；false=只本地更改）"
         type: choice
@@ -66,6 +66,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       WORK_BRANCH: ${{ inputs.work_branch }}
+
     steps:
       - name: Checkout repo (no submodules, no persisted creds)
         uses: actions/checkout@v4
@@ -180,10 +181,10 @@ jobs:
       - name: Push branch (optional)
         if: ${{ inputs.push_branch == 'true' }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}
         run: |
           set -euo pipefail
-          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           if [ "${{ inputs.force }}" = "true" ]; then
             git push --force-with-lease origin "HEAD:refs/heads/${WORK_BRANCH}"
           else
@@ -195,7 +196,7 @@ jobs:
         if: ${{ inputs.do_tag == 'true' }}
         id: tag_step
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}
         run: |
           set -euo pipefail
           TAG_IN='${{ inputs.version }}'; TAG="$TAG_IN"
@@ -209,8 +210,8 @@ jobs:
           LOCAL_BRANCH_SHA="$(git rev-parse "${BRANCH_REF}^{commit}")"
           echo "Local ${BRANCH_REF} HEAD: ${LOCAL_BRANCH_SHA}"
 
-          # 使用 GITHUB_TOKEN 设置远端并获取远端分支提交
-          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          # 用 PAT 设置远端并获取远端分支提交
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           REMOTE_BRANCH_SHA="$(git ls-remote origin "refs/heads/${WORK_BRANCH}" | awk '{print $1}')"
           echo "Remote refs/heads/${WORK_BRANCH}: ${REMOTE_BRANCH_SHA}"
 
@@ -227,7 +228,7 @@ jobs:
             git tag -a "${TAG}" -m "${MSG}" "${LOCAL_BRANCH_SHA}"
           fi
 
-          # 仅推送 Tag
+          # 仅推送 Tag（用 PAT）
           git push origin "refs/tags/${TAG}"
 
           # 解析远端 Tag 指向的“提交 SHA”（处理注释Tag的剥离）

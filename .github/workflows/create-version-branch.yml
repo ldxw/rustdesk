@@ -34,6 +34,8 @@ on:
 
 permissions:
   contents: write
+  # 如果你后续要在这个 workflow 里修改其它 workflow 文件，再加上：
+  # workflows: write
 
 jobs:
   validate_inputs:
@@ -208,18 +210,18 @@ jobs:
 
       - name: Push changes to remote
         env:
-          PAT: ${{ secrets.REPO_WORKFLOW_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           TARGET_BRANCH="${{ steps.source_info.outputs.target_branch }}"
           FORCE="${{ inputs.force }}"
 
-          # 确保当前就位于目标分支（避免 HEAD 指向其他分支时推送出错，且显式指定 refs/heads 防止与同名 tag 歧义）
-          git checkout "refs/heads/${TARGET_BRANCH}"
+          # 确保当前就位于目标分支（这里用分支名本身，HEAD 不会是 detached）
+          git checkout "$TARGET_BRANCH"
 
-          # 如配置了 PAT，用它作为 origin（PAT 作为密码放在 : 后面）
-          if [ -n "${PAT:-}" ]; then
-            git remote set-url origin "https://x-access-token:${PAT}@github.com/${GITHUB_REPOSITORY}.git"
+          # 使用 GITHUB_TOKEN 作为密码
+          if [ -n "${GITHUB_TOKEN:-}" ]; then
+            git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           fi
 
           # 明确推送到 refs/heads，避免与同名 tag 冲突

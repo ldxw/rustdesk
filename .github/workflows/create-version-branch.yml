@@ -1,4 +1,6 @@
-name: 从上游标签或master分支创建版本分支（保护工作流文件）
+name: 从上游拉取 ${{ inputs.source_type == 'tag' && inputs.version || 'master' }}
+
+run-name: 拉取 ${{ inputs.source_type == 'tag' && inputs.version || 'master' }} → ${{ inputs.source_type == 'tag' && inputs.version || 'latest' }}
 
 on:
   workflow_dispatch:
@@ -18,7 +20,7 @@ on:
       force:
         description: "是否强制覆盖同名远端分支（全量替换而非增量合并）"
         required: true
-        type: choice           # 兼容所有 Runner：用字符串选项代替 boolean
+        type: choice
         options:
           - "false"
           - "true"
@@ -34,8 +36,7 @@ on:
 
 permissions:
   contents: write
-  # 如果你后续要在这个 workflow 里修改其它 workflow 文件，再加上：
-  # workflows: write
+  workflows: write
 
 jobs:
   validate_inputs:
@@ -51,25 +52,25 @@ jobs:
           SOURCE_TYPE="${{ inputs.source_type }}"
           VERSION="${{ inputs.version }}"
           TARGET_DIR="${{ inputs.target_directory }}"
-          
+
           if [ "$SOURCE_TYPE" = "tag" ] && [ -z "${VERSION}" ]; then
             echo "::error::当源类型为tag时，版本号不能为空"
             echo "valid=false" >> "$GITHUB_OUTPUT"
             exit 1
           fi
-          
+
           if [ "$SOURCE_TYPE" = "master_branch" ] && [ -z "${TARGET_DIR}" ]; then
             echo "::error::当源类型为master_branch时，目标目录不能为空"
             echo "valid=false" >> "$GITHUB_OUTPUT"
             exit 1
           fi
-          
+
           if [ "$SOURCE_TYPE" = "tag" ]; then
             echo "target_branch=${VERSION}" >> "$GITHUB_OUTPUT"
           else
             echo "target_branch=latest" >> "$GITHUB_OUTPUT"
           fi
-          
+
           echo "target_dir=${TARGET_DIR}" >> "$GITHUB_OUTPUT"
           echo "valid=true" >> "$GITHUB_OUTPUT"
 
@@ -83,21 +84,39 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          # 注意：不要在这里用 ref 去检出 upstream 才有的 tag/分支
 
-      - name: 暂存工作流文件（防止被覆盖）
-        id: stash_workflow
+      # ✅ 更稳：把两个文件复制到 /tmp 备份，不依赖 stash
+      - name: 备份指定 workflow 文件到 /tmp（仅这两个）
+        id: backup_workflows
         run: |
           set -euo pipefail
-          WORKFLOW_FILE=".github/workflows/create-version-branch.yml"
-          if [ -f "$WORKFLOW_FILE" ]; then
-            git stash push -u -- "$WORKFLOW_FILE"
-            echo "stashed=true" >> "$GITHUB_OUTPUT"
-            echo "已暂存工作流文件"
+          WF1=".github/workflows/create-version-branch-and-tag.yml"
+          WF2=".github/workflows/create-version-branch.yml"
+          BKDIR="/tmp/workflow-backup"
+
+          mkdir -p "$BKDIR"
+          saved="false"
+
+          if [ -f "$WF1" ]; then
+            mkdir -p "$(dirname "$BKDIR/$WF1")"
+            cp -f "$WF1" "$BKDIR/$WF1"
+            echo "已备份 $WF1"
+            saved="true"
           else
-            echo "stashed=false" >> "$GITHUB_OUTPUT"
-            echo "工作流文件不存在，无需暂存"
+            echo "未找到 $WF1，跳过备份"
           fi
+
+          if [ -f "$WF2" ]; then
+            mkdir -p "$(dirname "$BKDIR/$WF2")"
+            cp -f "$WF2" "$BKDIR/$WF2"
+            echo "已备份 $WF2"
+            saved="true"
+          else
+            echo "未找到 $WF2，跳过备份"
+          fi
+
+          echo "saved=$saved" >> "$GITHUB_OUTPUT"
+          echo "bkdir=$BKDIR" >> "$GITHUB_OUTPUT"
 
       - name: Configure git identity
         run: |
@@ -111,7 +130,6 @@ jobs:
           set -euo pipefail
           UPSTREAM="${{ inputs.upstream_repo }}"
           git remote add upstream "https://github.com/${UPSTREAM}.git" || true
-          # 仅抓分支引用，不抓取任何 tag，避免 clobber
           git fetch upstream --no-tags
 
       - name: Determine source and target information
@@ -121,15 +139,15 @@ jobs:
           SOURCE_TYPE="${{ inputs.source_type }}"
           VERSION="${{ inputs.version }}"
           TARGET_BRANCH="${{ needs.validate_inputs.outputs.target_branch }}"
-          
+
           if [ "$SOURCE_TYPE" = "tag" ]; then
             echo "is_tag=true" >> "$GITHUB_OUTPUT"
             echo "source_name=tag ${VERSION}" >> "$GITHUB_OUTPUT"
-            echo "source_ref=${VERSION}" >> "$GITHUB_OUTPUT"   # 裸 tag 名
+            echo "source_ref=${VERSION}" >> "$GITHUB_OUTPUT"
           else
             echo "is_tag=false" >> "$GITHUB_OUTPUT"
             echo "source_name=master branch" >> "$GITHUB_OUTPUT"
-            echo "source_ref=master" >> "$GITHUB_OUTPUT"       # 上游分支名
+            echo "source_ref=master" >> "$GITHUB_OUTPUT"
           fi
           echo "target_branch=$TARGET_BRANCH" >> "$GITHUB_OUTPUT"
 
@@ -152,22 +170,20 @@ jobs:
           IS_TAG="${{ steps.source_info.outputs.is_tag }}"
           SRC="${{ steps.source_info.outputs.source_ref }}"
 
-          # 只抓需要的引用，避免 clobber 已有 tag
           git fetch upstream --no-tags
 
           if [ "$IS_TAG" = "true" ]; then
-            # 仅抓取目标 tag（必要时可加 --force 覆盖本地同名 tag）
-            git fetch --no-tags upstream tag "$SRC" || true
-            if ! git rev-parse -q --verify "refs/tags/$SRC" >/dev/null; then
-              echo "::error::未在 upstream 获取到 tag $SRC"
+            git fetch --no-tags upstream "refs/tags/${SRC}:refs/tags/${SRC}" || true
+            if ! git rev-parse -q --verify "refs/tags/${SRC}" >/dev/null; then
+              echo "::error::未在 upstream 获取到 tag ${SRC}"
               exit 1
             fi
-            git checkout -B "$TARGET_BRANCH" "refs/tags/$SRC"
-            git commit --allow-empty -m "Init $TARGET_BRANCH from upstream tag $SRC" || true
+            git checkout -B "refs/heads/${TARGET_BRANCH}" "refs/tags/${SRC}"
+            git commit --allow-empty -m "Init ${TARGET_BRANCH} from upstream tag ${SRC}" || true
           else
-            git fetch upstream "$SRC"
-            git checkout -B "$TARGET_BRANCH" "upstream/$SRC"
-            git commit --allow-empty -m "Init $TARGET_BRANCH from upstream $SRC" || true
+            git fetch upstream "${SRC}"
+            git checkout -B "refs/heads/${TARGET_BRANCH}" "upstream/${SRC}"
+            git commit --allow-empty -m "Init ${TARGET_BRANCH} from upstream ${SRC}" || true
           fi
 
       - name: Incremental merge upstream changes (增量拉取)
@@ -179,34 +195,53 @@ jobs:
           SRC="${{ steps.source_info.outputs.source_ref }}"
           SOURCE_NAME="${{ steps.source_info.outputs.source_name }}"
 
-          git checkout "$TARGET_BRANCH"
+          git checkout "refs/heads/${TARGET_BRANCH}"
           git fetch upstream --no-tags
 
           if [ "$IS_TAG" = "true" ]; then
-            git fetch --no-tags upstream tag "$SRC" || true
-            if ! git rev-parse -q --verify "refs/tags/$SRC" >/dev/null; then
-              echo "::error::未在 upstream 获取到 tag $SRC"
+            git fetch --no-tags upstream "refs/tags/${SRC}:refs/tags/${SRC}" || true
+            if ! git rev-parse -q --verify "refs/tags/${SRC}" >/dev/null; then
+              echo "::error::未在 upstream 获取到 tag ${SRC}"
               exit 1
             fi
-            git merge --no-ff -X theirs "refs/tags/$SRC" \
-              -m "Merge upstream $SOURCE_NAME into $TARGET_BRANCH (auto-resolve with upstream)" || true
+            git merge --no-ff -X theirs "refs/tags/${SRC}" \
+              -m "Merge upstream ${SOURCE_NAME} into ${TARGET_BRANCH} (auto-resolve with upstream)" || true
           else
-            git fetch upstream "$SRC"
-            git merge --no-ff -X theirs "upstream/$SRC" \
-              -m "Merge upstream $SOURCE_NAME into $TARGET_BRANCH (auto-resolve with upstream)" || true
+            git fetch upstream "${SRC}"
+            git merge --no-ff -X theirs "upstream/${SRC}" \
+              -m "Merge upstream ${SOURCE_NAME} into ${TARGET_BRANCH} (auto-resolve with upstream)" || true
           fi
 
-      - name: 恢复工作流文件（确保本地版本不被覆盖）
-        if: ${{ steps.stash_workflow.outputs.stashed == 'true' }}
+      # ✅ 恢复两个文件：覆盖回你自己的版本
+      - name: 恢复指定 workflow 文件（仅这两个保持本地）
+        if: ${{ steps.backup_workflows.outputs.saved == 'true' }}
         run: |
           set -euo pipefail
-          WORKFLOW_FILE=".github/workflows/create-version-branch.yml"
-          git stash pop --quiet || true
-          if ! git diff --quiet HEAD -- "$WORKFLOW_FILE"; then
-            git add "$WORKFLOW_FILE"
-            git commit -m "Preserve create-version-branch.yml from being overwritten"
+          BKDIR="${{ steps.backup_workflows.outputs.bkdir }}"
+          WF1=".github/workflows/create-version-branch-and-tag.yml"
+          WF2=".github/workflows/create-version-branch.yml"
+
+          restored="false"
+
+          if [ -f "$BKDIR/$WF1" ]; then
+            mkdir -p "$(dirname "$WF1")"
+            cp -f "$BKDIR/$WF1" "$WF1"
+            echo "已恢复 $WF1"
+            restored="true"
           fi
-          echo "已恢复并保护工作流文件"
+
+          if [ -f "$BKDIR/$WF2" ]; then
+            mkdir -p "$(dirname "$WF2")"
+            cp -f "$BKDIR/$WF2" "$WF2"
+            echo "已恢复 $WF2"
+            restored="true"
+          fi
+
+          if [ "$restored" = "true" ]; then
+            git add -A .github/workflows/create-version-branch-and-tag.yml .github/workflows/create-version-branch.yml || true
+            # 如果两个文件最终没变化，commit 会失败，用 || true 忽略
+            git commit -m "Preserve selected workflows from being overwritten" || true
+          fi
 
       - name: Push changes to remote
         env:
@@ -216,15 +251,12 @@ jobs:
           TARGET_BRANCH="${{ steps.source_info.outputs.target_branch }}"
           FORCE="${{ inputs.force }}"
 
-          # 确保当前就位于目标分支（这里用分支名本身，HEAD 不会是 detached）
-          git checkout "$TARGET_BRANCH"
+          git checkout "refs/heads/${TARGET_BRANCH}"
 
-          # 使用 GITHUB_TOKEN 作为密码
           if [ -n "${GITHUB_TOKEN:-}" ]; then
             git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           fi
 
-          # 明确推送到 refs/heads，避免与同名 tag 冲突
           if [ "$FORCE" = "true" ]; then
             git push --force-with-lease origin "HEAD:refs/heads/${TARGET_BRANCH}"
           else
@@ -237,8 +269,7 @@ jobs:
           set -euo pipefail
           TARGET_BRANCH="latest"
           TARGET_DIR="${{ needs.validate_inputs.outputs.target_dir }}"
-          
+
           mkdir -p "${TARGET_DIR}"
-          git --work-tree="${TARGET_DIR}" checkout "${TARGET_BRANCH}" -- .
-          
+          git --work-tree="${TARGET_DIR}" checkout "refs/heads/${TARGET_BRANCH}" -- .
           echo "已将上游内容增量更新到 ${TARGET_BRANCH} 分支，并检出到 ${TARGET_DIR} 目录"

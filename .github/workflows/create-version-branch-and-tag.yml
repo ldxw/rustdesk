@@ -1,5 +1,9 @@
 name: 更新分支并打Tag：子模块 + URL替换 + Tag锚定分支HEAD
 
+run-name: >-
+  更新 ${{ inputs.work_branch }}
+  ${{ inputs.do_tag == 'true' && format('+ 打Tag {0}', (inputs.version != '' && inputs.version || inputs.work_branch)) || '' }}
+
 on:
   workflow_dispatch:
     inputs:
@@ -8,55 +12,60 @@ on:
         required: true
         default: "1.4.2"
 
-      # 仅替换 https://admin.rustdesk.com
+      # 可选覆盖：留空则使用 Secrets.ADMIN_URL
       admin_url:
-        description: "将仓库内所有 https://admin.rustdesk.com 替换为该地址（不改子模块内容）"
-        required: true
-        default: "https://admin-hy.rs.ldxw.top"
+        description: "可选覆盖：将仓库内所有 https://admin.rustdesk.com 替换为该地址（留空=Secrets.ADMIN_URL；不改子模块）"
+        required: false
+        default: ""
 
-      # ⭐ 新增：下载地址替换（默认指向你自己的 tags 页）
+      # 可选覆盖：留空则使用 Secrets.DOWNLOAD_URL
       download_url:
-        description: "将仓库内所有 https://rustdesk.com/download 替换为该地址（排除子模块）"
-        required: true
-        default: "https://github.com/ldxw/rustdesk/tags"
+        description: "可选覆盖：将仓库内所有 https://rustdesk.com/download 替换为该地址（留空=Secrets.DOWNLOAD_URL；排除子模块）"
+        required: false
+        default: ""
 
-      # 子模块（公开仓库，HTTPS）
+      # 可选覆盖：留空则使用 Secrets.HBB_COMMON_URL
       submodule_url:
-        description: "libs/hbb_common 子模块公开仓库（HTTPS）地址"
-        required: true
-        default: "https://github.com/ldxw/rustdesk_hbb_common.git"
+        description: "可选覆盖：libs/hbb_common 子模块公开仓库（HTTPS）（留空=Secrets.HBB_COMMON_URL）"
+        required: false
+        default: ""
+
       submodule_branch:
         description: "libs/hbb_common 子模块分支（auto=自动检测远端默认分支）"
         required: true
         default: "auto"
 
-      # 推分支与打Tag选项
       push_branch:
-        description: "是否推送分支（true=推；false=只本地更改）"
+        description: "是否推送分支（true=推；false=只本地更改但仍可推Tag）"
         type: choice
         options: ["true", "false"]
         required: true
         default: "true"
+
       force:
         description: "推分支/建Tag是否强制（分支用 --force-with-lease；Tag 用 -f）"
         type: choice
         options: ["false", "true"]
         required: true
         default: "false"
+
       do_tag:
         description: "是否在分支HEAD打Tag"
         type: choice
         options: ["true", "false"]
         required: true
         default: "true"
+
       version:
         description: "Tag 名（留空使用 work_branch）"
         required: false
         default: ""
+
       tag_message:
         description: "Tag 注释"
         required: false
         default: "修改内置服务器和 key"
+
       retag:
         description: "是否强制重打Tag（先删远端同名Tag再建）"
         type: choice
@@ -73,12 +82,43 @@ jobs:
     env:
       WORK_BRANCH: ${{ inputs.work_branch }}
 
+      # —— 输入优先，留空走 secrets —— #
+      ADMIN_URL: ${{ inputs.admin_url != '' && inputs.admin_url || secrets.ADMIN_URL }}
+      DOWNLOAD_URL: ${{ inputs.download_url != '' && inputs.download_url || secrets.DOWNLOAD_URL }}
+      SUBMODULE_URL: ${{ inputs.submodule_url != '' && inputs.submodule_url || secrets.HBB_COMMON_URL }}
+
     steps:
       - name: Checkout repo (no submodules, no persisted creds)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Validate required secrets/inputs
+        run: |
+          set -euo pipefail
+          missing=0
+
+          if [ -z "${ADMIN_URL}" ]; then
+            echo "::error::ADMIN_URL 为空：请在 inputs.admin_url 填值或设置 Secrets.ADMIN_URL"
+            missing=1
+          fi
+          if [ -z "${DOWNLOAD_URL}" ]; then
+            echo "::error::DOWNLOAD_URL 为空：请在 inputs.download_url 填值或设置 Secrets.DOWNLOAD_URL"
+            missing=1
+          fi
+          if [ -z "${SUBMODULE_URL}" ]; then
+            echo "::error::SUBMODULE_URL 为空：请在 inputs.submodule_url 填值或设置 Secrets.HBB_COMMON_URL"
+            missing=1
+          fi
+
+          # PAT_TOKEN 必须存在
+          if [ -z "${{ secrets.PAT_TOKEN }}" ]; then
+            echo "::error::Secrets.PAT_TOKEN 未设置：请放入 Fine-grained PAT（Contents RW + Workflows RW）"
+            missing=1
+          fi
+
+          exit $missing
 
       - name: Git identity
         run: |
@@ -90,9 +130,10 @@ jobs:
         run: |
           set -euo pipefail
           git fetch origin --no-tags
+
           if git show-ref --verify --quiet "refs/remotes/origin/${WORK_BRANCH}"; then
             if git show-ref --verify --quiet "refs/heads/${WORK_BRANCH}"; then
-              git checkout "refs/heads/${WORK_BRANCH}"
+              git checkout "${WORK_BRANCH}"
               git merge --ff-only "refs/remotes/origin/${WORK_BRANCH}" || true
             else
               git checkout -B "${WORK_BRANCH}" "refs/remotes/origin/${WORK_BRANCH}"
@@ -102,6 +143,16 @@ jobs:
             exit 1
           fi
 
+      # —— 统一设置认证远端（Fine-grained PAT）—— #
+      - name: Set authenticated origin (PAT_TOKEN)
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -euo pipefail
+          git remote set-url origin "https://x-access-token:${PAT_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          # 验证能读到远端（避免后面才报 403）
+          git ls-remote origin -h "refs/heads/${WORK_BRANCH}" >/dev/null
+
       # 子模块：指向公开库 + 指定/自动分支，并更新指针
       - name: Configure submodule and update pointer
         id: sm_update
@@ -109,7 +160,7 @@ jobs:
           set -euo pipefail
           SM_NAME='libs/hbb_common'
           SM_PATH='libs/hbb_common'
-          SM_URL='${{ inputs.submodule_url }}'
+          SM_URL="${SUBMODULE_URL}"
           REQ_BRANCH='${{ inputs.submodule_branch }}'
 
           if [ ! -f .gitmodules ]; then
@@ -128,16 +179,18 @@ jobs:
           fi
           echo "sm_branch=${DETECTED_BRANCH}" >> "$GITHUB_OUTPUT"
 
+          # 更新 .gitmodules（url/path/branch）
           git config -f .gitmodules "submodule.${SM_NAME}.url"    "${SM_URL}"
           git config -f .gitmodules "submodule.${SM_NAME}.path"   "${SM_PATH}"
           git config -f .gitmodules "submodule.${SM_NAME}.branch" "${DETECTED_BRANCH}"
           git add .gitmodules
           if ! git diff --cached --quiet; then
-            git commit -m "chore: use public submodule ${SM_URL} (${DETECTED_BRANCH})"
+            git commit -m "chore: use public submodule (${DETECTED_BRANCH})"
           fi
 
+          # 同步并更新子模块到远端最新
           git submodule sync -- "${SM_PATH}"
-          git submodule set-url    "${SM_PATH}" "${SM_URL}" || true
+          git submodule set-url "${SM_PATH}" "${SM_URL}" || true
           git submodule set-branch --branch "${DETECTED_BRANCH}" "${SM_PATH}" || true
           git submodule update --init --remote "${SM_PATH}"
 
@@ -153,24 +206,18 @@ jobs:
             git commit -m "chore: bump submodule ${SM_PATH} to origin/${DETECTED_BRANCH} latest"
           fi
 
-      # 仅替换 https://admin.rustdesk.com（排除子模块目录）
+      # 替换 admin URL（排除子模块目录）
       - name: Replace admin HTTPS URLs (exclude submodule)
         run: |
           set -euo pipefail
-          NEW_URL='${{ inputs.admin_url }}'
 
-          echo "==> 替换前命中（前 80 行）"
-          (git grep -n -E 'https://admin\.rustdesk\.com' -- ':!:libs/hbb_common' || true) | head -n 80
+          hit_count=$(git grep -n -E 'https://admin\.rustdesk\.com' -- ':!:libs/hbb_common' | wc -l || true)
+          echo "admin.rustdesk.com 命中行数（排除子模块）: ${hit_count}"
 
           files_http=$(git grep -l -E 'https://admin\.rustdesk\.com' -- ':!:libs/hbb_common' || true)
           if [ -n "${files_http}" ]; then
-            new_esc=${NEW_URL//&/\\&}
+            new_esc=${ADMIN_URL//&/\\&}
             echo "${files_http}" | xargs -r sed -i -e "s|https://admin\.rustdesk\.com|${new_esc}|g"
-          fi
-
-          if [ -f "src/common.rs" ]; then
-            echo "==> src/common.rs 替换后关键行："
-            (grep -nE 'admin\.rustdesk\.com|rs\.ldxw\.top|admin-hy' src/common.rs || true) | head -n 50
           fi
 
           if ! git diff --quiet; then
@@ -180,21 +227,20 @@ jobs:
             echo "没有发现需要替换或内容已是目标值。"
           fi
 
-          echo "==> 替换后残留（前 80 行）"
-          (git grep -n -E 'https://admin\.rustdesk\.com' -- ':!:libs/hbb_common' || true) | head -n 80
+          remain=$(git grep -n -E 'https://admin\.rustdesk\.com' -- ':!:libs/hbb_common' | wc -l || true)
+          echo "替换后残留 admin.rustdesk.com 行数（排除子模块）: ${remain}"
 
-      # ⭐ 新增步骤：替换下载地址 https://rustdesk.com/download → 自定义下载URL（排除子模块）
+      # 替换 download URL（排除子模块）
       - name: Replace download URLs (exclude submodule)
         run: |
           set -euo pipefail
-          NEW_DL_URL='${{ inputs.download_url }}'
 
-          echo "==> 替换前命中下载URL（前 80 行）"
-          (git grep -n -E 'https://rustdesk\.com/download' -- ':!:libs/hbb_common' || true) | head -n 80
+          hit_count=$(git grep -n -E 'https://rustdesk\.com/download' -- ':!:libs/hbb_common' | wc -l || true)
+          echo "rustdesk.com/download 命中行数（排除子模块）: ${hit_count}"
 
           files_dl=$(git grep -l -E 'https://rustdesk\.com/download' -- ':!:libs/hbb_common' || true)
           if [ -n "${files_dl}" ]; then
-            new_esc=${NEW_DL_URL//&/\\&}
+            new_esc=${DOWNLOAD_URL//&/\\&}
             echo "${files_dl}" | xargs -r sed -i -e "s|https://rustdesk\.com/download|${new_esc}|g"
           fi
 
@@ -205,46 +251,39 @@ jobs:
             echo "没有发现需要替换下载地址或内容已是目标值。"
           fi
 
-          echo "==> 替换后残留下载URL（前 80 行）"
-          (git grep -n -E 'https://rustdesk\.com/download' -- ':!:libs/hbb_common' || true) | head -n 80
+          remain=$(git grep -n -E 'https://rustdesk\.com/download' -- ':!:libs/hbb_common' | wc -l || true)
+          echo "替换后残留 rustdesk.com/download 行数（排除子模块）: ${remain}"
 
-      # （可选）推送分支：让“版本分支页面”也显示最新内容
+      # （可选）推送分支
       - name: Push branch (optional)
         if: ${{ inputs.push_branch == 'true' }}
-        env:
-          GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}
         run: |
           set -euo pipefail
-          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           if [ "${{ inputs.force }}" = "true" ]; then
             git push --force-with-lease origin "HEAD:refs/heads/${WORK_BRANCH}"
           else
             git push origin "HEAD:refs/heads/${WORK_BRANCH}"
           fi
 
-      # 打 Tag：锚定“分支HEAD”并校验远端 Tag 指向远端分支 HEAD
+      # 打 Tag：锚定“分支HEAD”
       - name: Create/retarget tag at branch HEAD (verified)
         if: ${{ inputs.do_tag == 'true' }}
         id: tag_step
-        env:
-          GH_TOKEN: ${{ secrets.REPO_WORKFLOW_PAT }}
         run: |
           set -euo pipefail
-          TAG_IN='${{ inputs.version }}'; TAG="$TAG_IN"
+
+          TAG_IN='${{ inputs.version }}'
+          TAG="$TAG_IN"
           if [ -z "$TAG" ]; then TAG="${WORK_BRANCH}"; fi
+
           MSG='${{ inputs.tag_message }}'
           FORCE='${{ inputs.force }}'
           RETAG='${{ inputs.retag }}'
+          PUSH_BRANCH='${{ inputs.push_branch }}'
 
-          # 本地分支提交
           BRANCH_REF="refs/heads/${WORK_BRANCH}"
           LOCAL_BRANCH_SHA="$(git rev-parse "${BRANCH_REF}^{commit}")"
           echo "Local ${BRANCH_REF} HEAD: ${LOCAL_BRANCH_SHA}"
-
-          # 用 PAT 设置远端并获取远端分支提交
-          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          REMOTE_BRANCH_SHA="$(git ls-remote origin "refs/heads/${WORK_BRANCH}" | awk '{print $1}')"
-          echo "Remote refs/heads/${WORK_BRANCH}: ${REMOTE_BRANCH_SHA}"
 
           # （按需）先删远端同名 Tag
           if [ "$RETAG" = "true" ]; then
@@ -259,7 +298,7 @@ jobs:
             git tag -a "${TAG}" -m "${MSG}" "${LOCAL_BRANCH_SHA}"
           fi
 
-          # 仅推送 Tag（用 PAT）
+          # 推送 Tag
           git push origin "refs/tags/${TAG}"
 
           # 解析远端 Tag 指向的“提交 SHA”（处理注释Tag的剥离）
@@ -270,13 +309,24 @@ jobs:
           else
             REMOTE_COMMIT_SHA="${REMOTE_TAG_OBJ_SHA}"
           fi
-          echo "Remote Tag Peeled: ${REMOTE_COMMIT_SHA:-<none>}"
+          echo "Remote Tag Peeled Commit: ${REMOTE_COMMIT_SHA:-<none>}"
 
-          # 校验：远端 Tag 指向 == 远端分支 HEAD
-          if [ -z "${REMOTE_COMMIT_SHA}" ] || [ -z "${REMOTE_BRANCH_SHA}" ] || [ "${REMOTE_COMMIT_SHA}" != "${REMOTE_BRANCH_SHA}" ]; then
-            echo "::error::校验失败：远端Tag ${TAG}（${REMOTE_COMMIT_SHA:-<none>}）未指向远端分支 ${WORK_BRANCH} 的HEAD（${REMOTE_BRANCH_SHA:-<none>}）。"
-            echo "提示：若你希望分支也更新，请将输入 push_branch 设为 true。"
+          # 校验 1：远端 Tag 一定要指向“本地刚打的 commit”
+          if [ -z "${REMOTE_COMMIT_SHA}" ] || [ "${REMOTE_COMMIT_SHA}" != "${LOCAL_BRANCH_SHA}" ]; then
+            echo "::error::校验失败：远端Tag ${TAG}（${REMOTE_COMMIT_SHA:-<none>}）未指向本地分支HEAD（${LOCAL_BRANCH_SHA}）。"
             exit 1
+          fi
+
+          # 校验 2：如果你选择推分支，再校验“远端分支 HEAD == 远端 Tag 指向”
+          if [ "$PUSH_BRANCH" = "true" ]; then
+            REMOTE_BRANCH_SHA="$(git ls-remote origin "refs/heads/${WORK_BRANCH}" | awk '{print $1}')"
+            echo "Remote refs/heads/${WORK_BRANCH}: ${REMOTE_BRANCH_SHA}"
+            if [ -z "${REMOTE_BRANCH_SHA}" ] || [ "${REMOTE_BRANCH_SHA}" != "${REMOTE_COMMIT_SHA}" ]; then
+              echo "::error::校验失败：远端Tag ${TAG}（${REMOTE_COMMIT_SHA}）未指向远端分支 ${WORK_BRANCH} 的HEAD（${REMOTE_BRANCH_SHA:-<none>}）。"
+              exit 1
+            fi
+          else
+            echo "push_branch=false：跳过“远端分支HEAD一致性”校验（仅保证 Tag 指向本次 commit）。"
           fi
 
           echo "tag_name=${TAG}" >> "$GITHUB_OUTPUT"
@@ -288,12 +338,13 @@ jobs:
           git show -s --format="Commit %H%nDate   %ad%n%n%s" "refs/heads/${WORK_BRANCH}"
 
           if [ -f "src/common.rs" ]; then
-            echo "---- src/common.rs 关键行（确认替换） ----"
-            (grep -nE 'admin\.rustdesk\.com|rs\.ldxw\.top|admin-hy' src/common.rs || true) | head -n 80
+            echo "---- src/common.rs 关键行（确认替换：仅显示命中，不打印 secrets） ----"
+            (grep -nE 'admin\.rustdesk\.com|rustdesk\.com/download' src/common.rs || true) | head -n 80
           fi
 
           if [ "${{ inputs.do_tag }}" = "true" ]; then
-            TAG_IN='${{ inputs.version }}'; TAG="$TAG_IN"; if [ -z "$TAG" ]; then TAG="${WORK_BRANCH}"; fi
-            echo "---- Remote Tag ${TAG} (peeled) ----"
-            git show -s --format="Commit %H%nDate   %ad%n%n%s" "refs/tags/${TAG}^{ }" || git show -s --format="Commit %H%nDate   %ad%n%n%s" "refs/tags/${TAG}"
+            TAG_IN='${{ inputs.version }}'
+            TAG="$TAG_IN"; if [ -z "$TAG" ]; then TAG="${WORK_BRANCH}"; fi
+            echo "---- Remote Tag ${TAG} (peeled if annotated) ----"
+            git show -s --format="Commit %H%nDate   %ad%n%n%s" "refs/tags/${TAG}^{}" || git show -s --format="Commit %H%nDate   %ad%n%n%s" "refs/tags/${TAG}"
           fi

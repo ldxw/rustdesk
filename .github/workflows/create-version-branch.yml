@@ -1,6 +1,6 @@
-name: 从上游拉取 ${{ inputs.source_type == 'tag' && inputs.version || 'master' }}
+name: 从上游拉取（创建版本分支）
 
-run-name: 拉取 ${{ inputs.source_type == 'tag' && inputs.version || 'master' }} → ${{ inputs.source_type == 'tag' && inputs.version || 'latest' }}
+run-name: 拉取 ${{ github.event.inputs.source_type == 'tag' && github.event.inputs.version || 'master' }} → ${{ github.event.inputs.source_type == 'tag' && github.event.inputs.version || 'latest' }}
 
 on:
   workflow_dispatch:
@@ -36,7 +36,6 @@ on:
 
 permissions:
   contents: write
-  workflows: write
 
 jobs:
   validate_inputs:
@@ -49,9 +48,9 @@ jobs:
       - id: check
         run: |
           set -euo pipefail
-          SOURCE_TYPE="${{ inputs.source_type }}"
-          VERSION="${{ inputs.version }}"
-          TARGET_DIR="${{ inputs.target_directory }}"
+          SOURCE_TYPE="${{ github.event.inputs.source_type }}"
+          VERSION="${{ github.event.inputs.version }}"
+          TARGET_DIR="${{ github.event.inputs.target_directory }}"
 
           if [ "$SOURCE_TYPE" = "tag" ] && [ -z "${VERSION}" ]; then
             echo "::error::当源类型为tag时，版本号不能为空"
@@ -85,13 +84,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # ✅ 更稳：把两个文件复制到 /tmp 备份，不依赖 stash
+      # ✅ 更稳：/tmp 备份，仅保护这两个文件（其它 workflows 允许被上游覆盖/同步）
       - name: 备份指定 workflow 文件到 /tmp（仅这两个）
         id: backup_workflows
         run: |
           set -euo pipefail
-          WF1=".github/workflows/create-version-branch-and-tag.yml"
-          WF2=".github/workflows/create-version-branch.yml"
+          WF1=".github/workflows/create-version-branch.yml"
+          WF2=".github/workflows/create-version-branch-and-tag.yml"
           BKDIR="/tmp/workflow-backup"
 
           mkdir -p "$BKDIR"
@@ -128,16 +127,17 @@ jobs:
       - name: Add upstream repository
         run: |
           set -euo pipefail
-          UPSTREAM="${{ inputs.upstream_repo }}"
+          UPSTREAM="${{ github.event.inputs.upstream_repo }}"
           git remote add upstream "https://github.com/${UPSTREAM}.git" || true
+          # 先只抓分支引用，避免 tag/branch 同名导致歧义
           git fetch upstream --no-tags
 
       - name: Determine source and target information
         id: source_info
         run: |
           set -euo pipefail
-          SOURCE_TYPE="${{ inputs.source_type }}"
-          VERSION="${{ inputs.version }}"
+          SOURCE_TYPE="${{ github.event.inputs.source_type }}"
+          VERSION="${{ github.event.inputs.version }}"
           TARGET_BRANCH="${{ needs.validate_inputs.outputs.target_branch }}"
 
           if [ "$SOURCE_TYPE" = "tag" ]; then
@@ -149,6 +149,7 @@ jobs:
             echo "source_name=master branch" >> "$GITHUB_OUTPUT"
             echo "source_ref=master" >> "$GITHUB_OUTPUT"
           fi
+
           echo "target_branch=$TARGET_BRANCH" >> "$GITHUB_OUTPUT"
 
       - name: Check if target branch exists locally
@@ -163,7 +164,7 @@ jobs:
           fi
 
       - name: Initialize new branch from upstream source (首次拉取/强制覆盖)
-        if: ${{ steps.branch_check.outputs.branch_exists == 'false' || inputs.force == 'true' }}
+        if: ${{ steps.branch_check.outputs.branch_exists == 'false' || github.event.inputs.force == 'true' }}
         run: |
           set -euo pipefail
           TARGET_BRANCH="${{ steps.source_info.outputs.target_branch }}"
@@ -173,11 +174,13 @@ jobs:
           git fetch upstream --no-tags
 
           if [ "$IS_TAG" = "true" ]; then
+            # 只抓目标 tag（不会拉全量 tags）
             git fetch --no-tags upstream "refs/tags/${SRC}:refs/tags/${SRC}" || true
             if ! git rev-parse -q --verify "refs/tags/${SRC}" >/dev/null; then
               echo "::error::未在 upstream 获取到 tag ${SRC}"
               exit 1
             fi
+            # 用 refs/heads 明确创建分支，避免歧义
             git checkout -B "refs/heads/${TARGET_BRANCH}" "refs/tags/${SRC}"
             git commit --allow-empty -m "Init ${TARGET_BRANCH} from upstream tag ${SRC}" || true
           else
@@ -187,7 +190,7 @@ jobs:
           fi
 
       - name: Incremental merge upstream changes (增量拉取)
-        if: ${{ steps.branch_check.outputs.branch_exists == 'true' && inputs.force == 'false' }}
+        if: ${{ steps.branch_check.outputs.branch_exists == 'true' && github.event.inputs.force == 'false' }}
         run: |
           set -euo pipefail
           TARGET_BRANCH="${{ steps.source_info.outputs.target_branch }}"
@@ -212,14 +215,14 @@ jobs:
               -m "Merge upstream ${SOURCE_NAME} into ${TARGET_BRANCH} (auto-resolve with upstream)" || true
           fi
 
-      # ✅ 恢复两个文件：覆盖回你自己的版本
+      # ✅ 覆盖回你自己的两个文件：只保护这两个，其它 workflow 保持上游原样
       - name: 恢复指定 workflow 文件（仅这两个保持本地）
         if: ${{ steps.backup_workflows.outputs.saved == 'true' }}
         run: |
           set -euo pipefail
           BKDIR="${{ steps.backup_workflows.outputs.bkdir }}"
-          WF1=".github/workflows/create-version-branch-and-tag.yml"
-          WF2=".github/workflows/create-version-branch.yml"
+          WF1=".github/workflows/create-version-branch.yml"
+          WF2=".github/workflows/create-version-branch-and-tag.yml"
 
           restored="false"
 
@@ -238,24 +241,25 @@ jobs:
           fi
 
           if [ "$restored" = "true" ]; then
-            git add -A .github/workflows/create-version-branch-and-tag.yml .github/workflows/create-version-branch.yml || true
-            # 如果两个文件最终没变化，commit 会失败，用 || true 忽略
+            git add "$WF1" "$WF2" || true
             git commit -m "Preserve selected workflows from being overwritten" || true
           fi
 
-      - name: Push changes to remote
+      - name: Push changes to remote (use Fine-grained PAT)
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           set -euo pipefail
           TARGET_BRANCH="${{ steps.source_info.outputs.target_branch }}"
-          FORCE="${{ inputs.force }}"
+          FORCE="${{ github.event.inputs.force }}"
+
+          if [ -z "${PAT_TOKEN:-}" ]; then
+            echo "::error::缺少 secrets.PAT_TOKEN。同步上游 workflow 文件需要 PAT（Contents RW + Workflows RW）。"
+            exit 1
+          fi
 
           git checkout "refs/heads/${TARGET_BRANCH}"
-
-          if [ -n "${GITHUB_TOKEN:-}" ]; then
-            git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          fi
+          git remote set-url origin "https://x-access-token:${PAT_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 
           if [ "$FORCE" = "true" ]; then
             git push --force-with-lease origin "HEAD:refs/heads/${TARGET_BRANCH}"

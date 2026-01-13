@@ -14,7 +14,7 @@ on:
 
       # 可选覆盖：留空则使用 Secrets.ADMIN_URL
       admin_url:
-        description: "可选覆盖：将仓库内所有 https://admin.rustdesk.com 替换为该地址（留空=Secrets.ADMIN_URL；不改子模块）"
+        description: "可选覆盖：将仓库内所有 https://admin-hy.rs.ldxw.top 替换为该地址（留空=Secrets.ADMIN_URL；不改子模块）"
         required: false
         default: ""
 

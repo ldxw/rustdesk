@@ -20,7 +20,7 @@ on:
 
       # 可选覆盖：留空则使用 Secrets.DOWNLOAD_URL
       download_url:
-        description: "可选覆盖：将仓库内所有 https://rustdesk.com/download 替换为该地址（留空=Secrets.DOWNLOAD_URL；排除子模块）"
+        description: "可选覆盖：将仓库内所有 https://github.com/ldxw/rustdesk/tags 替换为该地址（留空=Secrets.DOWNLOAD_URL；排除子模块）"
         required: false
         default: ""
 

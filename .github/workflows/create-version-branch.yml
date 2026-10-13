@@ -48,9 +48,15 @@ on:
 permissions:
   contents: write
 
+# 同一个目标分支不要并发跑：两次运行会互相覆盖分支
+concurrency:
+  group: create-version-branch-${{ inputs.target_branch != '' && inputs.target_branch || (inputs.source_type == 'tag' && inputs.version || inputs.target_directory) }}
+  cancel-in-progress: false
+
 jobs:
   validate_inputs:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       valid: ${{ steps.check.outputs.valid }}
       target_branch: ${{ steps.check.outputs.target_branch }}
@@ -105,6 +111,7 @@ jobs:
     needs: validate_inputs
     if: ${{ needs.validate_inputs.outputs.valid == 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - name: Checkout fork (this repo) without persisting credentials
         uses: actions/checkout@v4
@@ -153,7 +160,8 @@ jobs:
           set -euo pipefail
           UPSTREAM="${{ inputs.upstream_repo }}"
           git remote add upstream "https://github.com/${UPSTREAM}.git" || true
-          git fetch upstream --no-tags
+          # 这里原先是一次 `git fetch upstream --no-tags`：全量拉上游所有分支与历史，
+          # 是整条流水线最慢的一步。实际只需要下面的「单个 tag」或「默认分支」定向拉取。
 
       - name: Detect upstream default branch (for master_branch mode)
         id: detect_upstream
@@ -180,8 +188,7 @@ jobs:
           SOURCE_NAME="${{ needs.validate_inputs.outputs.source_name }}"
           FORCE="${{ inputs.force }}"
 
-          git fetch upstream --no-tags
-
+          # 只做定向拉取（单个 tag / 默认分支），不再全量 fetch
           if [ "$IS_TAG" = "true" ]; then
             # tag 模式：支持“首次/强制覆盖”与“增量 merge”
             if git show-ref --verify --quiet "refs/heads/${TARGET_BRANCH}"; then
@@ -207,6 +214,13 @@ jobs:
               fi
               git merge --no-ff -X theirs "refs/tags/${SRC}" \
                 -m "Merge upstream ${SOURCE_NAME} into ${TARGET_BRANCH} (auto-resolve with upstream)" || true
+              # -X theirs 只能解决内容冲突；「双方都新增 / 一方删除」这类冲突会留下 MERGE_HEAD。
+              # 原来不管结果就继续，会把冲突状态的分支推上去，这里显式失败。
+              if [ -f .git/MERGE_HEAD ]; then
+                echo "::error::合并上游 ${SRC} 未完成（有未解决冲突），已中止，不推送。"
+                git status --short | head -20
+                exit 1
+              fi
             fi
           else
             # ✅ master_branch 模式：镜像上游“默认分支” -> 目标分支（你填写的名字）
@@ -268,15 +282,23 @@ jobs:
           if [ "$IS_TAG" = "false" ]; then
             echo "master_branch 模式：推送目标分支 ${TARGET_BRANCH}（镜像上游默认分支）"
             git push --force-with-lease origin "HEAD:refs/heads/${TARGET_BRANCH}"
-            exit 0
-          fi
-
-          # tag 分支：按输入 force 决定
-          if [ "$FORCE" = "true" ]; then
+          elif [ "$FORCE" = "true" ]; then
+            # tag 分支：按输入 force 决定
             git push --force-with-lease origin "HEAD:refs/heads/${TARGET_BRANCH}"
           else
             git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
           fi
+
+          # 推送后校验：远端分支必须等于本地 HEAD，避免「以为推上去了」
+          LOCAL_SHA="$(git rev-parse HEAD)"
+          REMOTE_SHA="$(git ls-remote origin "refs/heads/${TARGET_BRANCH}" | awk '{print $1}')"
+          echo "本地 HEAD=${LOCAL_SHA}"
+          echo "远端 ${TARGET_BRANCH}=${REMOTE_SHA:-<none>}"
+          if [ -z "$REMOTE_SHA" ] || [ "$REMOTE_SHA" != "$LOCAL_SHA" ]; then
+            echo "::error::推送校验失败：远端 ${TARGET_BRANCH} 与本地 HEAD 不一致。"
+            exit 1
+          fi
+          echo "推送校验通过"
 
       - name: Checkout to target directory (master_branch only)
         if: ${{ needs.validate_inputs.outputs.is_tag == 'false' }}

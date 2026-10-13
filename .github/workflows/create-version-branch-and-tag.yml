@@ -310,6 +310,43 @@ jobs:
           fi
           echo "替换校验通过：src/ 已无官方默认 URL"
 
+      # —— 应用内「更新」入口改为打开自有下载页 —— #
+      # 原逻辑：Windows/macOS 已安装版点「更新」走 handleUpdate()，它去 api.rustdesk.com 查最新版本、
+      # 再从官方地址直接下载并安装【官方安装包】—— 会把本仓库定制过的客户端覆盖成官方版。
+      # 这里把该入口改成与「下载」按钮一致：打开 DOWNLOAD_URL（自有下载页，用户拿到的永远是本仓库构建的包）。
+      - name: Redirect in-app update button to own download page
+        run: |
+          set -euo pipefail
+          F='flutter/lib/desktop/pages/desktop_home_page.dart'
+          # 与「下载」按钮同源：输入 > Secrets.DOWNLOAD_URL > 内置默认
+          TARGET="${DOWNLOAD_URL}"
+
+          if [ ! -f "$F" ]; then
+            echo "::warning::$F 不存在，跳过应用内更新入口重定向"
+            exit 0
+          fi
+
+          if grep -q "launchUrl(Uri.parse('${TARGET}'))" "$F"; then
+            echo "已经是目标写法，跳过。"
+            exit 0
+          fi
+
+          if ! grep -q 'handleUpdate(updateUrl);' "$F"; then
+            echo "::error::未在 $F 找到 'handleUpdate(updateUrl);'（上游代码可能已改动）。已中止，避免发出「点更新会去下官方包」的客户端。"
+            exit 1
+          fi
+
+          # 写进 Dart 单引号字符串：只需转义 \ 和 ' ；| 是下面 sed 的分隔符也一并转义
+          esc=$(printf '%s' "${TARGET}" | sed -e "s/[\\'|]/\\&/g")
+          sed -i "s|handleUpdate(updateUrl);|launchUrl(Uri.parse('${esc}'));|g" "$F"
+          echo "替换结果："
+          grep -n "launchUrl(Uri.parse('" "$F" | head -5
+
+          if ! git diff --quiet; then
+            git add "$F"
+            git commit -m "chore: in-app update button opens own download page"
+          fi
+
       # （可选）推送分支
       - name: Push branch (optional)
         if: ${{ inputs.push_branch == 'true' }}

@@ -101,6 +101,8 @@ jobs:
           persist-credentials: false
 
       - name: Validate required secrets/inputs
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           set -euo pipefail
           missing=0
@@ -118,8 +120,8 @@ jobs:
             missing=1
           fi
 
-          # PAT_TOKEN 必须存在
-          if [ -z "${{ secrets.PAT_TOKEN }}" ]; then
+          # PAT_TOKEN 必须存在（走 env 传入，避免把 secret 拼进脚本文本）
+          if [ -z "${PAT_TOKEN:-}" ]; then
             echo "::error::Secrets.PAT_TOKEN 未设置：请放入 Fine-grained PAT（Contents RW + Workflows RW）"
             missing=1
           fi
@@ -135,7 +137,9 @@ jobs:
       - name: Prepare branch locally
         run: |
           set -euo pipefail
-          git fetch origin --no-tags
+          # 只取需要的那个分支（原来是无参数 `git fetch origin --no-tags`，
+          # 会把仓库所有版本分支的完整历史都拉一遍，是这一步最耗时的原因）
+          git fetch origin --no-tags "${WORK_BRANCH}"
 
           if git show-ref --verify --quiet "refs/remotes/origin/${WORK_BRANCH}"; then
             if git show-ref --verify --quiet "refs/heads/${WORK_BRANCH}"; then
@@ -162,12 +166,14 @@ jobs:
       # 子模块：指向公开库 + 指定/自动分支，并更新指针
       - name: Configure submodule and update pointer
         id: sm_update
+        env:
+          SUBMODULE_BRANCH: ${{ inputs.submodule_branch }}
         run: |
           set -euo pipefail
           SM_NAME='libs/hbb_common'
           SM_PATH='libs/hbb_common'
           SM_URL="${SUBMODULE_URL}"
-          REQ_BRANCH='${{ inputs.submodule_branch }}'
+          REQ_BRANCH="${SUBMODULE_BRANCH:-auto}"
 
           if [ ! -f .gitmodules ]; then
             echo "::error::.gitmodules 不存在，项目未声明子模块。"
@@ -218,9 +224,11 @@ jobs:
       # 新版本分支忘记改就会发出「版本号错标」的包。这里用将要打的 Tag 覆盖它。
       - name: Sync env.VERSION in flutter-build.yml with tag
         if: ${{ inputs.do_tag == 'true' }}
+        env:
+          TAG_IN: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          TAG='${{ inputs.version }}'
+          TAG="${TAG_IN:-}"
           if [ -z "$TAG" ]; then TAG="${WORK_BRANCH}"; fi
           TAG="${TAG#v}"
           if ! printf '%s' "$TAG" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
@@ -244,11 +252,10 @@ jobs:
           hit_count=$(git grep -n -E 'https://admin\.rustdesk\.com' -- ':!:libs/hbb_common' | wc -l || true)
           echo "admin.rustdesk.com 命中行数（排除子模块）: ${hit_count}"
 
-          files_http=$(git grep -l -E 'https://admin\.rustdesk\.com' -- ':!:libs/hbb_common' || true)
-          if [ -n "${files_http}" ]; then
-            new_esc=${ADMIN_URL//&/\\&}
-            echo "${files_http}" | xargs -r sed -i -e "s|https://admin\.rustdesk\.com|${new_esc}|g"
-          fi
+          # -z/-0：文件名含空格或换行也不会漏；转义 \ & | 三个字符，避免替换串破坏 sed 表达式
+          new_esc=$(printf '%s' "${ADMIN_URL}" | sed -e 's/[\\&|]/\\&/g')
+          git grep -l -z -E 'https://admin\.rustdesk\.com' -- ':!:libs/hbb_common' \
+            | xargs -0 -r sed -i -e "s|https://admin\.rustdesk\.com|${new_esc}|g"
 
           if ! git diff --quiet; then
             git add -A
@@ -268,11 +275,10 @@ jobs:
           hit_count=$(git grep -n -E 'https://rustdesk\.com/download' -- ':!:libs/hbb_common' | wc -l || true)
           echo "rustdesk.com/download 命中行数（排除子模块）: ${hit_count}"
 
-          files_dl=$(git grep -l -E 'https://rustdesk\.com/download' -- ':!:libs/hbb_common' || true)
-          if [ -n "${files_dl}" ]; then
-            new_esc=${DOWNLOAD_URL//&/\\&}
-            echo "${files_dl}" | xargs -r sed -i -e "s|https://rustdesk\.com/download|${new_esc}|g"
-          fi
+          # 同上：-z/-0 + 转义 \ & |
+          new_esc=$(printf '%s' "${DOWNLOAD_URL}" | sed -e 's/[\\&|]/\\&/g')
+          git grep -l -z -E 'https://rustdesk\.com/download' -- ':!:libs/hbb_common' \
+            | xargs -0 -r sed -i -e "s|https://rustdesk\.com/download|${new_esc}|g"
 
           if ! git diff --quiet; then
             git add -A
@@ -318,14 +324,17 @@ jobs:
       - name: Create/retarget tag at branch HEAD (verified)
         if: ${{ inputs.do_tag == 'true' }}
         id: tag_step
+        env:
+          # 通过 env 传入：用户填的内容里若含单引号/特殊字符，直接拼进脚本会破坏引号
+          TAG_IN: ${{ inputs.version }}
+          TAG_MSG: ${{ inputs.tag_message }}
         run: |
           set -euo pipefail
 
-          TAG_IN='${{ inputs.version }}'
-          TAG="$TAG_IN"
+          TAG="${TAG_IN:-}"
           if [ -z "$TAG" ]; then TAG="${WORK_BRANCH}"; fi
 
-          MSG='${{ inputs.tag_message }}'
+          MSG="${TAG_MSG:-}" 
           FORCE='${{ inputs.force }}'
           RETAG='${{ inputs.retag }}'
           PUSH_BRANCH='${{ inputs.push_branch }}'
@@ -381,6 +390,8 @@ jobs:
           echo "tag_name=${TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Show final refs and snippet
+        env:
+          TAG_IN: ${{ inputs.version }}
         run: |
           set -euo pipefail
           echo "---- Local refs/heads/${WORK_BRANCH} ----"
@@ -392,8 +403,7 @@ jobs:
           fi
 
           if [ "${{ inputs.do_tag }}" = "true" ]; then
-            TAG_IN='${{ inputs.version }}'
-            TAG="$TAG_IN"; if [ -z "$TAG" ]; then TAG="${WORK_BRANCH}"; fi
+            TAG="${TAG_IN:-}"; if [ -z "$TAG" ]; then TAG="${WORK_BRANCH}"; fi
             echo "---- Remote Tag ${TAG} (peeled if annotated) ----"
             git show -s --format="Commit %H%nDate   %ad%n%n%s" "refs/tags/${TAG}^{}" || git show -s --format="Commit %H%nDate   %ad%n%n%s" "refs/tags/${TAG}"
           fi

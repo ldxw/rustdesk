@@ -1,8 +1,8 @@
 name: 从上游拉取（创建版本分支）
 
 run-name: >-
-  拉取 ${{ inputs.source_type == 'tag' && inputs.version || 'upstream default branch' }}
-  → ${{ inputs.source_type == 'tag' && inputs.version || (inputs.target_directory != '' && inputs.target_directory || 'latest') }}
+  拉取 ${{ inputs.source_type == 'tag' && format('{0}@{1}', inputs.upstream_repo, inputs.version) || '上游默认分支' }}
+  → ${{ inputs.source_type == 'tag' && (inputs.target_branch != '' && inputs.target_branch || inputs.version) || (inputs.target_directory != '' && inputs.target_directory || 'latest') }}
 
 on:
   workflow_dispatch:
@@ -20,6 +20,11 @@ on:
         description: "上游 Tag（如 1.4.2，仅当源类型为tag时有效）"
         required: false
         default: "1.4.2"
+
+      target_branch:
+        description: "可选：目标分支名（tag 模式专用；留空 = 与上游 Tag 同名，例如上游 Tag 填 1.4.9、这里填 1.5.0）"
+        required: false
+        default: ""
 
       force:
         description: "是否强制覆盖同名远端分支（tag 分支推送用 --force-with-lease；master_branch 固定镜像推送）"
@@ -67,10 +72,21 @@ jobs:
               echo "valid=false" >> "$GITHUB_OUTPUT"
               exit 1
             fi
+            # 目标分支名：留空则与上游 Tag 同名（保持原行为）
+            TARGET_BRANCH_INPUT="${{ inputs.target_branch }}"
+            TARGET_BRANCH="${TARGET_BRANCH_INPUT:-$VERSION}"
+            if ! printf '%s' "$TARGET_BRANCH" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]*$'; then
+              echo "::error::目标分支名 '${TARGET_BRANCH}' 含非法字符（只允许字母数字与 . _ / -，且不以符号开头）"
+              echo "valid=false" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+            if [ "$TARGET_BRANCH" != "$VERSION" ]; then
+              echo "目标分支名与上游 Tag 不同：${VERSION} -> ${TARGET_BRANCH}"
+            fi
             echo "is_tag=true" >> "$GITHUB_OUTPUT"
             echo "source_ref=${VERSION}" >> "$GITHUB_OUTPUT"
             echo "source_name=tag ${VERSION}" >> "$GITHUB_OUTPUT"
-            echo "target_branch=${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "target_branch=${TARGET_BRANCH}" >> "$GITHUB_OUTPUT"
             echo "target_dir=" >> "$GITHUB_OUTPUT"
           else
             # master_branch：目标分支名 = 你填的 target_directory（留空则 latest）

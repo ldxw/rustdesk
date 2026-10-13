@@ -76,9 +76,15 @@ on:
 permissions:
   contents: write
 
+# 同一个分支/版本不要并发跑：两次运行会互相覆盖分支与 Tag
+concurrency:
+  group: create-version-branch-and-tag-${{ inputs.work_branch }}
+  cancel-in-progress: false
+
 jobs:
   update_and_tag:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       WORK_BRANCH: ${{ inputs.work_branch }}
 
@@ -206,6 +212,30 @@ jobs:
             git commit -m "chore: bump submodule ${SM_PATH} to origin/${DETECTED_BRANCH} latest"
           fi
 
+
+      # —— 版本号自动对齐 —— #
+      # flutter-build.yml 的 env.VERSION 是手写的（master 上还停在 1.4.4），
+      # 新版本分支忘记改就会发出「版本号错标」的包。这里用将要打的 Tag 覆盖它。
+      - name: Sync env.VERSION in flutter-build.yml with tag
+        if: ${{ inputs.do_tag == 'true' }}
+        run: |
+          set -euo pipefail
+          TAG='${{ inputs.version }}'
+          if [ -z "$TAG" ]; then TAG="${WORK_BRANCH}"; fi
+          TAG="${TAG#v}"
+          if ! printf '%s' "$TAG" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::warning::Tag '${TAG}' 不是 x.y.z 形式，跳过 env.VERSION 同步"
+            exit 0
+          fi
+          F=.github/workflows/flutter-build.yml
+          cur="$(sed -nE 's/^  VERSION: "([^"]*)".*/\1/p' "$F" | head -1)"
+          echo "env.VERSION 当前=${cur:-<未找到>}，目标=${TAG}"
+          if [ "$cur" = "$TAG" ]; then echo "已一致，无需改动"; exit 0; fi
+          sed -i -E "s/^  VERSION: \"[^\"]*\"/  VERSION: \"${TAG}\"/" "$F"
+          grep -nE '^  VERSION:' "$F"
+          git add "$F"
+          git commit -m "chore: sync env.VERSION to ${TAG}"
+
       # 替换 admin URL（排除子模块目录）
       - name: Replace admin HTTPS URLs (exclude submodule)
         run: |
@@ -253,6 +283,25 @@ jobs:
 
           remain=$(git grep -n -E 'https://rustdesk\.com/download' -- ':!:libs/hbb_common' | wc -l || true)
           echo "替换后残留 rustdesk.com/download 行数（排除子模块）: ${remain}"
+
+
+      # —— 替换结果校验 —— #
+      # 原来只打印命中数，不判断是否真的替换成功：上游改 URL 写法时会静默带着官方地址出包。
+      # 这里对「真正会打进二进制」的 src/ 做硬校验，其它位置（文档等）只看数量。
+      - name: Verify URL replacement took effect
+        run: |
+          set -euo pipefail
+          bad=0
+          for pat in 'https://admin\.rustdesk\.com' 'https://rustdesk\.com/download'; do
+            n=$(git grep -n -E "$pat" -- 'src/' | wc -l || true)
+            echo "src/ 中残留 ${pat} 行数: ${n}"
+            if [ "$n" != "0" ]; then bad=1; fi
+          done
+          if [ "$bad" = "1" ]; then
+            echo "::error::src/ 里仍有官方默认 URL，替换没生效（查 inputs/secrets 与上游 URL 写法）。已中止，避免发出带官方地址的包。"
+            exit 1
+          fi
+          echo "替换校验通过：src/ 已无官方默认 URL"
 
       # （可选）推送分支
       - name: Push branch (optional)

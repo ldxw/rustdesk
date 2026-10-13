@@ -18,9 +18,9 @@ on:
         required: false
         default: ""
 
-      # 可选覆盖：留空则使用 Secrets.DOWNLOAD_URL
+      # 替换目标：按 输入 > Secrets.DOWNLOAD_URL > 内置默认 的顺序取值
       download_url:
-        description: "可选覆盖：将仓库内所有 https://rustdesk.com/download 替换为该地址（留空=Secrets.DOWNLOAD_URL；排除子模块）"
+        description: "可选覆盖：把仓库内所有 https://rustdesk.com/download 替换为该地址（留空=Secrets.DOWNLOAD_URL，仍为空则用内置默认 https://home.ldxw.de/url/rustdesk.html；排除子模块）"
         required: false
         default: ""
 
@@ -90,7 +90,8 @@ jobs:
 
       # —— 输入优先，留空走 secrets —— #
       ADMIN_URL: ${{ inputs.admin_url != '' && inputs.admin_url || secrets.ADMIN_URL }}
-      DOWNLOAD_URL: ${{ inputs.download_url != '' && inputs.download_url || secrets.DOWNLOAD_URL }}
+      # 三级回退：输入 > Secrets.DOWNLOAD_URL > 内置默认（自有下载页，自动识别系统/架构后直接下载）
+      DOWNLOAD_URL: ${{ inputs.download_url != '' && inputs.download_url || (secrets.DOWNLOAD_URL != '' && secrets.DOWNLOAD_URL || 'https://home.ldxw.de/url/rustdesk.html') }}
       SUBMODULE_URL: ${{ inputs.submodule_url != '' && inputs.submodule_url || secrets.HBB_COMMON_URL }}
 
     steps:
@@ -112,7 +113,7 @@ jobs:
             missing=1
           fi
           if [ -z "${DOWNLOAD_URL}" ]; then
-            echo "::error::DOWNLOAD_URL 为空：请在 inputs.download_url 填值或设置 Secrets.DOWNLOAD_URL"
+            echo "::error::DOWNLOAD_URL 为空：请填 inputs.download_url 或设置 Secrets.DOWNLOAD_URL（内置默认不该为空，出现即说明表达式被改动）"
             missing=1
           fi
           if [ -z "${SUBMODULE_URL}" ]; then
